@@ -4,7 +4,7 @@ using UnityEngine;
 using UnityEngine.Rendering;
 using System.IO;
 
-public class OneSweep : MonoBehaviour
+public class BlockRadixSort : MonoBehaviour
 {
     private enum TestType
     {
@@ -24,7 +24,7 @@ public class OneSweep : MonoBehaviour
         //Because this results in a higher entropy than the default, it tends to have better performance.
         AllPassTimingTestRandom,
 
-        //Executes the algorithm 2000 times, then records the execution time in a csv file
+        //Executes the algorithm 500 times, then records the execution time in a csv file
         RecordTimingData,
     }
 
@@ -46,13 +46,6 @@ public class OneSweep : MonoBehaviour
     private ComputeBuffer sortBuffer;
     private ComputeBuffer altBuffer;
     private ComputeBuffer globalHistBuffer;
-
-    private ComputeBuffer indexBuffer;
-    private ComputeBuffer passHistBuffer;
-    private ComputeBuffer passHistTwo;
-    private ComputeBuffer passHistThree;
-    private ComputeBuffer passHistFour;
-
     private ComputeBuffer timingBuffer;
 
     private const int minSize = 15;
@@ -66,11 +59,8 @@ public class OneSweep : MonoBehaviour
     private const int k_scatterThree = 5;
     private const int k_scatterFour = 6;
 
-    private int binningThreadBlocks;
-    private int globalHistThreadBlocks;
     private int radixPasses;
     private int radix;
-    private int partitionSize;
     private string computeShaderString;
 
     private uint[] validationArray;
@@ -78,14 +68,11 @@ public class OneSweep : MonoBehaviour
     private int size;
     private bool breaker;
 
-    OneSweep()
+    BlockRadixSort()
     {
         radixPasses = 4;
         radix = 256;
-        binningThreadBlocks = 512;
-        globalHistThreadBlocks = 2048;
-        partitionSize = 7680;
-        computeShaderString = "OneSweep";
+        computeShaderString = "BlockRadixSort";
     }
 
     private void Start()
@@ -95,7 +82,6 @@ public class OneSweep : MonoBehaviour
         size = 1 << sizeExponent;
         UpdateSize(size);
         UpdateGlobHistBuffer();
-        UpdateIndexBuffer();
         UpdateTimingBuffer();
         breaker = true;
 
@@ -156,7 +142,7 @@ public class OneSweep : MonoBehaviour
     {
         try
         {
-            compute.FindKernel("InitOneSweep");
+            compute.FindKernel("InitBlockRadixSort");
         }
         catch
         {
@@ -171,7 +157,6 @@ public class OneSweep : MonoBehaviour
     {
         compute.SetInt("e_size", _size);
         UpdateSortBuffers(_size);
-        UpdatePassHistBuffer(_size);
     }
 
     private void UpdateSortBuffers(int _size)
@@ -201,41 +186,6 @@ public class OneSweep : MonoBehaviour
         compute.SetBuffer(k_scatterFour, "b_alt", altBuffer);
     }
 
-    private void UpdatePassHistBuffer(int _size)
-    {
-        if (passHistBuffer != null)
-            passHistBuffer.Dispose();
-        if (passHistTwo != null)
-            passHistTwo.Dispose();
-        if (passHistThree != null)
-            passHistThree.Dispose();
-        if (passHistFour != null)
-            passHistFour.Dispose();
-
-        passHistBuffer = new ComputeBuffer(_size / partitionSize * radix, sizeof(uint));
-        passHistTwo = new ComputeBuffer(_size / partitionSize * radix, sizeof(uint));
-        passHistThree = new ComputeBuffer(_size / partitionSize * radix, sizeof(uint));
-        passHistFour = new ComputeBuffer(_size / partitionSize * radix, sizeof(uint));
-
-        //init
-        compute.SetBuffer(k_init, "b_passHist", passHistBuffer);
-        compute.SetBuffer(k_init, "b_passTwo", passHistTwo);
-        compute.SetBuffer(k_init, "b_passThree", passHistThree);
-        compute.SetBuffer(k_init, "b_passFour", passHistFour);
-
-        //init random
-        compute.SetBuffer(k_initRandom, "b_passHist", passHistBuffer);
-        compute.SetBuffer(k_initRandom, "b_passTwo", passHistTwo);
-        compute.SetBuffer(k_initRandom, "b_passThree", passHistThree);
-        compute.SetBuffer(k_initRandom, "b_passFour", passHistFour);
-
-        //scatters
-        compute.SetBuffer(k_scatterOne, "b_passHist", passHistBuffer);
-        compute.SetBuffer(k_scatterTwo, "b_passTwo", passHistTwo);
-        compute.SetBuffer(k_scatterThree, "b_passThree", passHistThree);
-        compute.SetBuffer(k_scatterFour, "b_passFour", passHistFour);
-    }
-
     private void UpdateGlobHistBuffer()
     {
         globalHistBuffer = new ComputeBuffer(radix * radixPasses, sizeof(uint));
@@ -248,25 +198,13 @@ public class OneSweep : MonoBehaviour
         compute.SetBuffer(k_scatterThree, "b_globalHist", globalHistBuffer);
         compute.SetBuffer(k_scatterFour, "b_globalHist", globalHistBuffer);
     }
-    private void UpdateIndexBuffer()
-    {
-        indexBuffer = new ComputeBuffer(radixPasses, sizeof(uint));
 
-        compute.SetBuffer(k_init, "b_index", indexBuffer);
-        compute.SetBuffer(k_initRandom, "b_index", indexBuffer);
-
-        compute.SetBuffer(k_scatterOne, "b_index", indexBuffer);
-        compute.SetBuffer(k_scatterTwo, "b_index", indexBuffer);
-        compute.SetBuffer(k_scatterThree, "b_index", indexBuffer);
-        compute.SetBuffer(k_scatterFour, "b_index", indexBuffer);
-    }
     private void UpdateTimingBuffer()
     {
         timingBuffer = new ComputeBuffer(1, sizeof(uint));
         compute.SetBuffer(k_scatterOne, "b_timing", timingBuffer);
         compute.SetBuffer(k_scatterFour, "b_timing", timingBuffer);
     }
-
 
     private void ResetBuffers()
     {
@@ -284,15 +222,15 @@ public class OneSweep : MonoBehaviour
         breaker = false;
         validationArray = new uint[_size];
 
-        compute.Dispatch(k_globalHist, globalHistThreadBlocks, 1, 1);
+        compute.Dispatch(k_globalHist, 1, 1, 1);
 
-        compute.Dispatch(k_scatterOne, binningThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterOne, 1, 1, 1);
 
-        compute.Dispatch(k_scatterTwo, binningThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterTwo, 1, 1, 1);
 
-        compute.Dispatch(k_scatterThree, binningThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterThree, 1, 1, 1);
 
-        compute.Dispatch(k_scatterFour, binningThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterFour, 1, 1, 1);
 
         sortBuffer.GetData(validationArray);
         yield return new WaitForSeconds(.25f);  //To prevent unity from crashing
@@ -307,15 +245,15 @@ public class OneSweep : MonoBehaviour
         validationArray = new uint[_size];
         ResetBuffersRandom();
 
-        compute.Dispatch(k_globalHist, globalHistThreadBlocks, 1, 1);
+        compute.Dispatch(k_globalHist, 1, 1, 1);
 
-        compute.Dispatch(k_scatterOne, binningThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterOne, 1, 1, 1);
 
-        compute.Dispatch(k_scatterTwo, binningThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterTwo, 1, 1, 1);
 
-        compute.Dispatch(k_scatterThree, binningThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterThree, 1, 1, 1);
 
-        compute.Dispatch(k_scatterFour, binningThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterFour, 1, 1, 1);
 
         sortBuffer.GetData(validationArray);
         yield return new WaitForSeconds(.25f);  //To prevent unity from crashing
@@ -328,12 +266,12 @@ public class OneSweep : MonoBehaviour
     {
         breaker = false;
 
-        compute.Dispatch(k_globalHist, globalHistThreadBlocks, 1, 1);
+        compute.Dispatch(k_globalHist, 1, 1, 1);
         AsyncGPUReadbackRequest request = AsyncGPUReadback.Request(globalHistBuffer);
         yield return new WaitUntil(() => request.done);
 
         float time = Time.realtimeSinceStartup;
-        compute.Dispatch(k_scatterOne, binningThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterOne, 1, 1, 1);
         request = AsyncGPUReadback.Request(timingBuffer);
         yield return new WaitUntil(() => request.done);
         time = Time.realtimeSinceStartup - time;
@@ -348,19 +286,19 @@ public class OneSweep : MonoBehaviour
     {
         breaker = false;
 
-        AsyncGPUReadbackRequest request = AsyncGPUReadback.Request(passHistFour);
+        AsyncGPUReadbackRequest request = AsyncGPUReadback.Request(globalHistBuffer);
         yield return new WaitUntil(() => request.done);
 
         float time = Time.realtimeSinceStartup;
-        compute.Dispatch(k_globalHist, globalHistThreadBlocks, 1, 1);
+        compute.Dispatch(k_globalHist, 1, 1, 1);
 
-        compute.Dispatch(k_scatterOne, binningThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterOne, 1, 1, 1);
 
-        compute.Dispatch(k_scatterTwo, binningThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterTwo, 1, 1, 1);
 
-        compute.Dispatch(k_scatterThree, binningThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterThree, 1, 1, 1);
 
-        compute.Dispatch(k_scatterFour, binningThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterFour, 1, 1, 1);
 
         request = AsyncGPUReadback.Request(timingBuffer);
         yield return new WaitUntil(() => request.done);
@@ -377,19 +315,19 @@ public class OneSweep : MonoBehaviour
         breaker = false;
 
         ResetBuffersRandom();
-        AsyncGPUReadbackRequest request = AsyncGPUReadback.Request(passHistFour);
+        AsyncGPUReadbackRequest request = AsyncGPUReadback.Request(globalHistBuffer);
         yield return new WaitUntil(() => request.done);
 
         float time = Time.realtimeSinceStartup;
-        compute.Dispatch(k_globalHist, globalHistThreadBlocks, 1, 1);
+        compute.Dispatch(k_globalHist, 1, 1, 1);
 
-        compute.Dispatch(k_scatterOne, binningThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterOne, 1, 1, 1);
 
-        compute.Dispatch(k_scatterTwo, binningThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterTwo, 1, 1, 1);
 
-        compute.Dispatch(k_scatterThree, binningThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterThree, 1, 1, 1);
 
-        compute.Dispatch(k_scatterFour, binningThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterFour, 1, 1, 1);
 
         request = AsyncGPUReadback.Request(timingBuffer);
         yield return new WaitUntil(() => request.done);
@@ -410,24 +348,24 @@ public class OneSweep : MonoBehaviour
         List<string> csv = new List<string>();
         float time;
 
-        for (int i = 0; i < 2000; ++i)
+        for (int i = 0; i < 500; ++i)
         {
             compute.SetInt("e_seed", i + 1);
             compute.Dispatch(k_initRandom, 256, 1, 1);
-            AsyncGPUReadbackRequest request = AsyncGPUReadback.Request(passHistFour);
+            AsyncGPUReadbackRequest request = AsyncGPUReadback.Request(globalHistBuffer);
             yield return new WaitUntil(() => request.done);
 
             time = Time.realtimeSinceStartup;
 
-            compute.Dispatch(k_globalHist, globalHistThreadBlocks, 1, 1);
+            compute.Dispatch(k_globalHist, 1, 1, 1);
 
-            compute.Dispatch(k_scatterOne, binningThreadBlocks, 1, 1);
+            compute.Dispatch(k_scatterOne, 1, 1, 1);
 
-            compute.Dispatch(k_scatterTwo, binningThreadBlocks, 1, 1);
+            compute.Dispatch(k_scatterTwo, 1, 1, 1);
 
-            compute.Dispatch(k_scatterThree, binningThreadBlocks, 1, 1);
+            compute.Dispatch(k_scatterThree, 1, 1, 1);
 
-            compute.Dispatch(k_scatterFour, binningThreadBlocks, 1, 1);
+            compute.Dispatch(k_scatterFour, 1, 1, 1);
 
             request = AsyncGPUReadback.Request(timingBuffer);
             yield return new WaitUntil(() => request.done);
@@ -512,18 +450,6 @@ public class OneSweep : MonoBehaviour
             altBuffer.Dispose();
         if (globalHistBuffer != null)
             globalHistBuffer.Dispose();
-        if (indexBuffer != null)
-            indexBuffer.Dispose();
-
-        if (passHistBuffer != null)
-            passHistBuffer.Dispose();
-        if (passHistTwo != null)
-            passHistTwo.Dispose();
-        if (passHistThree != null)
-            passHistThree.Dispose();
-        if (passHistFour != null)
-            passHistFour.Dispose();
-
         if (timingBuffer != null)
             timingBuffer.Dispose();
     }

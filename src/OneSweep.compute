@@ -35,7 +35,7 @@
  *
  ******************************************************************************/
 #pragma use_dxc
-#pragma kernel Init
+#pragma kernel InitOneSweep
 #pragma kernel InitRandom
 #pragma kernel GlobalHistogram 
 #pragma kernel FirstBinningPass
@@ -117,7 +117,7 @@ groupshared uint g_waveHists[BIN_PART_SIZE];    //Shared memory for the per wave
 groupshared uint g_reductionHist[RADIX];        //Shared memory for reduced per wave histograms during digit binning pass
 
 [numthreads(1024, 1, 1)]
-void Init(int3 id : SV_DispatchThreadID)
+void InitOneSweep(int3 id : SV_DispatchThreadID)
 {
     for (int i = id.x; i < e_size; i += 1024 * 256)
         b_sort[i] = e_size - i;
@@ -193,7 +193,7 @@ void GlobalHistogram(int3 gtid : SV_GroupThreadID, int3 gid : SV_GroupID)
     GroupMemoryBarrierWithGroupSync();
     
     //prefixsum
-    for(int i = WAVE_INDEX << LANE_LOG; i < RADIX; i += G_HIST_THREADS)
+    for (int i = WAVE_INDEX << LANE_LOG; i < RADIX; i += G_HIST_THREADS)
         g_globalHist[(LANE + 1 & LANE_MASK) + i] = WavePrefixSum(g_globalHist[LANE + i]) + g_globalHist[LANE + i];
     GroupMemoryBarrierWithGroupSync();
     
@@ -228,7 +228,7 @@ void FirstBinningPass(int3 gtid : SV_GroupThreadID)
     {
         //atomically fetch and increment device memory index to assign partition tiles
         //Take advantage of the barrier to also clear the shared memory
-        if(LANE == 0 && WAVE_INDEX == 0)
+        if (LANE == 0 && WAVE_INDEX == 0)
             InterlockedAdd(b_index[0], 1, g_localHist[0]);
         GroupMemoryBarrierWithGroupSync();
         partitionIndex = WaveReadLaneAt(g_localHist[0], 0);
@@ -277,7 +277,7 @@ void FirstBinningPass(int3 gtid : SV_GroupThreadID)
         uint4 bits = countbits(firstOffsets << LANE_MASK - LANE);
         int index = (firstKeys.x & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
         uint prev = g_waveHists[index];
-        if(bits.x == 1)
+        if (bits.x == 1)
             g_waveHists[index] += countbits(firstOffsets.x);
         firstOffsets.x = prev + bits.x - 1;
         
@@ -428,8 +428,8 @@ void FirstBinningPass(int3 gtid : SV_GroupThreadID)
             g_reductionHist[LANE << LANE_LOG] = WavePrefixSum(g_reductionHist[LANE << LANE_LOG]);
         GroupMemoryBarrierWithGroupSync();
 
-        if(GROUP_THREAD_ID < RADIX && LANE)
-            g_reductionHist[GROUP_THREAD_ID] += WaveReadLaneAt(g_reductionHist[GROUP_THREAD_ID - 1], 1); //check this later
+        if (GROUP_THREAD_ID < RADIX && LANE)
+            g_reductionHist[GROUP_THREAD_ID] += WaveReadLaneAt(g_reductionHist[GROUP_THREAD_ID - 1], 1);
         GroupMemoryBarrierWithGroupSync();
         
         //Update offsets
@@ -485,7 +485,7 @@ void FirstBinningPass(int3 gtid : SV_GroupThreadID)
             g_waveHists[firstOffsets[i]] = firstKeys[i];
             g_waveHists[secOffsets[i]] = secKeys[i];
             g_waveHists[thirdOffsets[i]] = thirdKeys[i];
-            if(i < 3)
+            if (i < 3)
                 g_waveHists[fourthOffsets[i]] = fourthKeys[i];
         }
         GroupMemoryBarrierWithGroupSync();
@@ -502,7 +502,7 @@ void FirstBinningPass(int3 gtid : SV_GroupThreadID)
                 if (LANE == 0)
                     g_waveHists[WAVE_INDEX] = partitionIndex;
                 
-                for (int k = partitionIndex - LANE - 1; 0 <= k; )
+                for (int k = partitionIndex - LANE - 1; 0 <= k;)
                 {
                     uint flagPayload = b_passHist[i * BIN_PARTITIONS + k];
                     if (WaveActiveAllTrue((flagPayload & FLAG_MASK) > FLAG_NOT_READY))
@@ -539,7 +539,7 @@ void FirstBinningPass(int3 gtid : SV_GroupThreadID)
         }
         else
         {
-            if(GROUP_THREAD_ID < RADIX)
+            if (GROUP_THREAD_ID < RADIX)
                 g_reductionHist[GROUP_THREAD_ID] = (GROUP_THREAD_ID ? g_localHist[GROUP_THREAD_ID] : 0) - g_reductionHist[GROUP_THREAD_ID];
         }
         GroupMemoryBarrierWithGroupSync();
@@ -806,7 +806,7 @@ void SecBinningPass(int3 gtid : SV_GroupThreadID)
         GroupMemoryBarrierWithGroupSync();
 
         if (GROUP_THREAD_ID < RADIX && LANE)
-            g_reductionHist[GROUP_THREAD_ID] += WaveReadLaneAt(g_reductionHist[GROUP_THREAD_ID - 1], 1); //check this later
+            g_reductionHist[GROUP_THREAD_ID] += WaveReadLaneAt(g_reductionHist[GROUP_THREAD_ID - 1], 1);
         GroupMemoryBarrierWithGroupSync();
         
         //Update offsets
@@ -1180,7 +1180,7 @@ void ThirdBinningPass(int3 gtid : SV_GroupThreadID)
         GroupMemoryBarrierWithGroupSync();
 
         if (GROUP_THREAD_ID < RADIX && LANE)
-            g_reductionHist[GROUP_THREAD_ID] += WaveReadLaneAt(g_reductionHist[GROUP_THREAD_ID - 1], 1); //check this later
+            g_reductionHist[GROUP_THREAD_ID] += WaveReadLaneAt(g_reductionHist[GROUP_THREAD_ID - 1], 1);
         GroupMemoryBarrierWithGroupSync();
         
         //Update offsets
@@ -1554,7 +1554,7 @@ void FourthBinningPass(int3 gtid : SV_GroupThreadID, int3 gid : SV_GroupID)
         GroupMemoryBarrierWithGroupSync();
 
         if (GROUP_THREAD_ID < RADIX && LANE)
-            g_reductionHist[GROUP_THREAD_ID] += WaveReadLaneAt(g_reductionHist[GROUP_THREAD_ID - 1], 1); //check this later
+            g_reductionHist[GROUP_THREAD_ID] += WaveReadLaneAt(g_reductionHist[GROUP_THREAD_ID - 1], 1);
         GroupMemoryBarrierWithGroupSync();
         
         //Update offsets
