@@ -1,7 +1,7 @@
 /******************************************************************************
- * Block Level 8-bit LSD Radix Sort
+ * Single Threadblock 8-bit LSD Radix Sort
  *
- * Author:  Thomas Smith 8/16/2023
+ * Author:  Thomas Smith 8/30/2023
  *
  * License: The Unlicense
  *          This is free and unencumbered software released into the public domain.
@@ -21,6 +21,7 @@
 #define LANE_COUNT          32      //Lanes per wave, Nvidia hardware
 #define LANE_MASK           31      //Mask of the lane count
 #define LANE_LOG            5       //log2(LANE_COUNT)
+#define VEC_SIZE            4       //Size of a four element vector
 
 #define RADIX               256     //Number of digit bins
 #define RADIX_MASK          255     //Mask of digit bins
@@ -50,6 +51,7 @@
 #define BIN_SUB_PART_SIZE   256                                     //The subpartition tile size of a single wave in a BinningPass threadblock
 #define BIN_SUB_PART_LOG    8                                       //log2(BIN_SUB_PART_SIZE)
 #define BIN_WAVES           31                                      //The number of waves in a BinningPass threadblock
+#define BIN_KEY_VECS        2                                       //Size of the per thread vector array in a BinningPass threadblock
 
 #define BIN_PARTITIONS      (e_size / BIN_PART_SIZE)                //The number of partition tiles in the BinningPass
 #define BIN_PART_START      (partitionIndex * BIN_PART_SIZE)        //The starting offset of a BinningPass partition tile
@@ -64,17 +66,17 @@
 #define LCG_STEP    (z4 * 1664525 + 1013904223U)
 #define HYBRID_TAUS (z1 ^ z2 ^ z3 ^ z4)
 
-extern int e_size;                                      //Input size, passed in from CPU
-extern uint e_seed;                                     //Seed for PRNGS, passed in from CPU
+extern int e_size;                                                  //Input size, passed in from CPU
+extern uint e_seed;                                                 //Seed for PRNGS, passed in from CPU
 
-RWBuffer<uint> b_sort;                                  //buffer to be sorted
-RWBuffer<uint> b_alt;                                   //double buffer
-RWBuffer<uint> b_globalHist;                            //buffer holding device level offsets for each binning pass
-RWBuffer<uint> b_timing;                                //To time the execution of the kernels
+RWBuffer<uint> b_sort;                                              //buffer to be sorted
+RWBuffer<uint> b_alt;                                               //double buffer
+RWBuffer<uint> b_globalHist;                                        //buffer holding device level offsets for each binning pass
+RWBuffer<uint> b_timing;                                            //To time the execution of the kernels
 
-groupshared uint4 g_globalHist[G_HIST_SHARED_MEM];      //Shared memory for performing the upfront global histogram
-groupshared uint g_localHist[RADIX];                    //Threadgroup copy of globalHist during digit binning passes
-groupshared uint g_waveHists[BIN_PART_SIZE];            //Shared memory for the per wave histograms during digit binning passes
+groupshared uint4 g_globalHist[G_HIST_SHARED_MEM];                  //Shared memory for performing the upfront global histogram
+groupshared uint g_localHist[RADIX];                                //Threadgroup copy of globalHist during digit binning passes
+groupshared uint g_waveHists[BIN_PART_SIZE];                        //Shared memory for the per wave histograms during digit binning passes
 
 [numthreads(1024, 1, 1)]
 void InitBlockRadixSort(int3 id : SV_DispatchThreadID)
@@ -102,6 +104,9 @@ void InitRandom(int3 id : SV_DispatchThreadID)
         z4 = LCG_STEP;
         b_sort[i] = HYBRID_TAUS;
     }
+    
+    for (int i = id.x; i < 1024; i += 1024 * 256)
+        b_globalHist[i] = 0;
 }
 
 [numthreads(LANE_COUNT, G_HIST_WAVES, 1)]
@@ -140,7 +145,7 @@ void GlobalHistogram(int3 gtid : SV_GroupThreadID)
     GroupMemoryBarrierWithGroupSync();
     
     //Vectorized prefix sum
-    if(WAVE_INDEX < (RADIX >> LANE_LOG))
+    if (WAVE_INDEX < (RADIX >> LANE_LOG))
         g_globalHist[(LANE + 1 & LANE_MASK) + (WAVE_INDEX << LANE_LOG)] = WavePrefixSum(g_globalHist[GROUP_THREAD_ID]) + g_globalHist[GROUP_THREAD_ID];
     GroupMemoryBarrierWithGroupSync();
     
@@ -149,113 +154,77 @@ void GlobalHistogram(int3 gtid : SV_GroupThreadID)
     GroupMemoryBarrierWithGroupSync();
     
     const uint t3 = GROUP_THREAD_ID & RADIX_MASK;
-    b_globalHist[GROUP_THREAD_ID] = (LANE ? g_globalHist[t3][WAVE_INDEX >> 3] : 0) + 
+    b_globalHist[GROUP_THREAD_ID] = (LANE ? g_globalHist[t3][WAVE_INDEX >> 3] : 0) +
         (WAVE_INDEX & 7 ? WaveReadLaneAt(g_globalHist[t3 - LANE_COUNT][WAVE_INDEX >> 3], 0) : 0);
 }
 
 [numthreads(LANE_COUNT, BIN_WAVES, 1)]
 void FirstBinningPass(int3 gtid : SV_GroupThreadID)
 {
-    if(GROUP_THREAD_ID < RADIX)
+    if (GROUP_THREAD_ID < RADIX)
         g_localHist[GROUP_THREAD_ID] = b_globalHist[GROUP_THREAD_ID];
     GroupMemoryBarrierWithGroupSync();
     
     for (int partitionIndex = 0; partitionIndex < BIN_PARTITIONS; ++partitionIndex)
     {
         //clear
-        for (int i = LANE; i < RADIX; i += LANE_COUNT)
-            g_waveHists[i + (WAVE_INDEX << RADIX_LOG)] = 0;
+        {
+            for (int i = LANE; i < RADIX; i += LANE_COUNT)
+                g_waveHists[i + (WAVE_INDEX << RADIX_LOG)] = 0;
+        }
         
         //read
-        const int t = LANE + BIN_SUB_PART_START + BIN_PART_START;
-        uint4 firstKeys;
-        firstKeys.x = b_sort[t];
-        firstKeys.y = b_sort[t + 32];
-        firstKeys.z = b_sort[t + 64];
-        firstKeys.w = b_sort[t + 96];
-        
-        uint4 secKeys;
-        secKeys.x = b_sort[t + 128];
-        secKeys.y = b_sort[t + 160];
-        secKeys.z = b_sort[t + 192];
-        secKeys.w = b_sort[t + 224];
-        
-        //Warp Level Multisplit, manually unrolled
-        uint4 firstOffsets = 0xFFFFFFFF;
-        for (int k = 0; k < RADIX_LOG; ++k)
+        uint4 keys[BIN_KEY_VECS];
         {
-            const bool4 t = firstKeys >> k & 1;
-            firstOffsets.x &= (t.x ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.x);
-            firstOffsets.y &= (t.y ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.y);
-            firstOffsets.z &= (t.z ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.z);
-            firstOffsets.w &= (t.w ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.w);
+            const int t = LANE + BIN_SUB_PART_START + BIN_PART_START;
+            
+            [unroll]
+            for (int i = 0; i < BIN_KEY_VECS; ++i)
+            {
+                keys[i].x = b_sort[t + (i << 7)];
+                keys[i].y = b_sort[t + (i << 7) + 32];
+                keys[i].z = b_sort[t + (i << 7) + 64];
+                keys[i].w = b_sort[t + (i << 7) + 96];
+            }
         }
         
-        uint4 bits = countbits(firstOffsets << LANE_MASK - LANE);
-        int index = (firstKeys.x & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        uint prev = g_waveHists[index];
-        if (bits.x == 1)
-            g_waveHists[index] += countbits(firstOffsets.x);
-        firstOffsets.x = prev + bits.x - 1;
-        
-        index = (firstKeys.y & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.y == 1)
-            g_waveHists[index] += countbits(firstOffsets.y);
-        firstOffsets.y = prev + bits.y - 1;
-        
-        index = (firstKeys.z & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.z == 1)
-            g_waveHists[index] += countbits(firstOffsets.z);
-        firstOffsets.z = prev + bits.z - 1;
-        
-        index = (firstKeys.w & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.w == 1)
-            g_waveHists[index] += countbits(firstOffsets.w);
-        firstOffsets.w = prev + bits.w - 1;
-        
-        //Second
-        uint4 secOffsets = 0xFFFFFFFF;
-        for (int k = 0; k < RADIX_LOG; ++k)
+        //Warp Level Multisplit
+        uint4 offsets[BIN_KEY_VECS];
         {
-            const bool4 t = secKeys >> k & 1;
-            secOffsets.x &= (t.x ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.x);
-            secOffsets.y &= (t.y ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.y);
-            secOffsets.z &= (t.z ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.z);
-            secOffsets.w &= (t.w ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.w);
+            [unroll]
+            for (int i = 0; i < BIN_KEY_VECS; ++i)
+            {
+                offsets[i] = 0xFFFFFFFF;
+
+                [unroll]
+                for (int k = 0; k < RADIX_LOG; ++k)
+                {
+                    const bool4 t = keys[i] >> k & 1;
+                    offsets[i].x &= (t.x ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.x);
+                    offsets[i].y &= (t.y ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.y);
+                    offsets[i].z &= (t.z ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.z);
+                    offsets[i].w &= (t.w ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.w);
+                }
+                
+                const uint4 bits = countbits(offsets[i] << LANE_MASK - LANE);
+                const uint t = (WAVE_INDEX << RADIX_LOG);
+                
+                [unroll]
+                for (k = 0; k < VEC_SIZE; ++k)
+                {
+                    const int index = (keys[i][k] & RADIX_MASK) + t;
+                    const uint prev = g_waveHists[index];
+                    if (bits[k] == 1)
+                        g_waveHists[index] += countbits(offsets[i][k]);
+                    offsets[i][k] = prev + bits[k] - 1;
+                }
+            }
         }
-        
-        bits = countbits(secOffsets << LANE_MASK - LANE);
-        index = (secKeys.x & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.x == 1)
-            g_waveHists[index] += countbits(secOffsets.x);
-        secOffsets.x = prev + bits.x - 1;
-        
-        index = (secKeys.y & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.y == 1)
-            g_waveHists[index] += countbits(secOffsets.y);
-        secOffsets.y = prev + bits.y - 1;
-        
-        index = (secKeys.z & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.z == 1)
-            g_waveHists[index] += countbits(secOffsets.z);
-        secOffsets.z = prev + bits.z - 1;
-        
-        index = (secKeys.w & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.w == 1)
-            g_waveHists[index] += countbits(secOffsets.w);
-        secOffsets.w = prev + bits.w - 1;
         GroupMemoryBarrierWithGroupSync();
         
         //exclusive prefix sum across the histograms, store the reduction for later
         //serial per-thread significantly faster than per wave with intrinsics
-        uint reduction;
+        uint save;
         if (GROUP_THREAD_ID < RADIX)
         {
             const int t = GROUP_THREAD_ID;
@@ -264,7 +233,7 @@ void FirstBinningPass(int3 gtid : SV_GroupThreadID)
                 g_waveHists[t] += g_waveHists[k];
                 g_waveHists[k] = g_waveHists[t] - g_waveHists[k];
             }
-            reduction = g_waveHists[t];
+            save = g_waveHists[t];
         }
         GroupMemoryBarrierWithGroupSync();
         
@@ -277,13 +246,12 @@ void FirstBinningPass(int3 gtid : SV_GroupThreadID)
             g_waveHists[LANE << LANE_LOG] = WavePrefixSum(g_waveHists[LANE << LANE_LOG]);
         GroupMemoryBarrierWithGroupSync();
 
-        uint decrement;
         if (GROUP_THREAD_ID < RADIX)
         {
             if (LANE)
                 g_waveHists[GROUP_THREAD_ID] += WaveReadLaneAt(g_waveHists[GROUP_THREAD_ID - 1], 1);
-            decrement = g_waveHists[GROUP_THREAD_ID];
-            g_localHist[GROUP_THREAD_ID] -= decrement;
+            save += g_waveHists[GROUP_THREAD_ID];
+            g_localHist[GROUP_THREAD_ID] -= g_waveHists[GROUP_THREAD_ID];
         }
         GroupMemoryBarrierWithGroupSync();
         
@@ -291,66 +259,69 @@ void FirstBinningPass(int3 gtid : SV_GroupThreadID)
         if (WAVE_INDEX)
         {
             const uint t = WAVE_INDEX << RADIX_LOG;
-            firstOffsets.x += g_waveHists[(firstKeys.x & RADIX_MASK) + t] + g_waveHists[firstKeys.x & RADIX_MASK];
-            firstOffsets.y += g_waveHists[(firstKeys.y & RADIX_MASK) + t] + g_waveHists[firstKeys.y & RADIX_MASK];
-            firstOffsets.z += g_waveHists[(firstKeys.z & RADIX_MASK) + t] + g_waveHists[firstKeys.z & RADIX_MASK];
-            firstOffsets.w += g_waveHists[(firstKeys.w & RADIX_MASK) + t] + g_waveHists[firstKeys.w & RADIX_MASK];
-
-            secOffsets.x += g_waveHists[(secKeys.x & RADIX_MASK) + t] + g_waveHists[secKeys.x & RADIX_MASK];
-            secOffsets.y += g_waveHists[(secKeys.y & RADIX_MASK) + t] + g_waveHists[secKeys.y & RADIX_MASK];
-            secOffsets.z += g_waveHists[(secKeys.z & RADIX_MASK) + t] + g_waveHists[secKeys.z & RADIX_MASK];
-            secOffsets.w += g_waveHists[(secKeys.w & RADIX_MASK) + t] + g_waveHists[secKeys.w & RADIX_MASK];
+            
+            [unroll]
+            for (int i = 0; i < BIN_KEY_VECS; ++i)
+            {
+                [unroll]
+                for (int k = 0; k < VEC_SIZE; ++k)
+                {
+                    const uint t2 = keys[i][k] & RADIX_MASK;
+                    offsets[i][k] += g_waveHists[t2 + t] + g_waveHists[t2];
+                }
+            }
         }
         else
         {
-            firstOffsets.x += g_waveHists[firstKeys.x & RADIX_MASK];
-            firstOffsets.y += g_waveHists[firstKeys.y & RADIX_MASK];
-            firstOffsets.z += g_waveHists[firstKeys.z & RADIX_MASK];
-            firstOffsets.w += g_waveHists[firstKeys.w & RADIX_MASK];
-
-            secOffsets.x += g_waveHists[secKeys.x & RADIX_MASK];
-            secOffsets.y += g_waveHists[secKeys.y & RADIX_MASK];
-            secOffsets.z += g_waveHists[secKeys.z & RADIX_MASK];
-            secOffsets.w += g_waveHists[secKeys.w & RADIX_MASK];
+            [unroll]
+            for (int i = 0; i < BIN_KEY_VECS; ++i)
+            {
+                [unroll]
+                for (int k = 0; k < VEC_SIZE; ++k)
+                {
+                    offsets[i][k] += g_waveHists[keys[i][k] & RADIX_MASK];
+                }
+            }
         }
         GroupMemoryBarrierWithGroupSync();
         
         //Scatter keys into shared memory
-        //For some bizarre reason, this is signicantly faster rolled 
-        for (int i = 0; i < 4; ++i)
         {
-            g_waveHists[firstOffsets[i]] = firstKeys[i];
-            g_waveHists[secOffsets[i]] = secKeys[i];
+            [unroll]
+            for (int i = 0; i < VEC_SIZE; ++i)
+            {
+                g_waveHists[offsets[0][i]] = keys[0][i];
+                g_waveHists[offsets[1][i]] = keys[1][i];
+            }
         }
         GroupMemoryBarrierWithGroupSync();
         
         //Scatter runs of keys into device memory;
-        for (int i = GROUP_THREAD_ID; i < BIN_PART_SIZE; i += BIN_THREADS)
         {
-            firstKeys.x = g_waveHists[i];
-            firstKeys.y = firstKeys.x & RADIX_MASK;
-            firstKeys.z = g_localHist[firstKeys.y] + i;
-            b_alt[firstKeys.z] = firstKeys.x;
+            for (int i = GROUP_THREAD_ID; i < BIN_PART_SIZE; i += BIN_THREADS)
+                b_alt[g_localHist[g_waveHists[i] & RADIX_MASK] + i] = g_waveHists[i];
         }
         GroupMemoryBarrierWithGroupSync();
         
         //Update histogram
-        if(GROUP_THREAD_ID < RADIX)
-            g_localHist[GROUP_THREAD_ID] += decrement + reduction;
+        if (GROUP_THREAD_ID < RADIX)
+            g_localHist[GROUP_THREAD_ID] += save;
     }
     GroupMemoryBarrierWithGroupSync();
     
     for (int i = GROUP_THREAD_ID + BIN_PART_START; i < e_size; i += BIN_THREADS)
     {
         const uint key = b_sort[i];
-        
         uint offset = 0xFFFFFFFF;
+        
+        [unroll]
         for (int k = 0; k < RADIX_LOG; ++k)
         {
             const bool t = key >> k & 1;
             offset &= (t ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t);
         }
         
+        [unroll]
         for (int k = 0; k < BIN_WAVES; ++k)
         {
             if (WAVE_INDEX == k)
@@ -367,7 +338,7 @@ void FirstBinningPass(int3 gtid : SV_GroupThreadID)
     }
     
     //for timing the execution of the kernel
-    if(LANE == 0 && WAVE_INDEX == 0)
+    if (LANE == 0 && WAVE_INDEX == 0)
         b_timing[0] = 1;
 }
 
@@ -381,99 +352,63 @@ void SecBinningPass(int3 gtid : SV_GroupThreadID)
     for (int partitionIndex = 0; partitionIndex < BIN_PARTITIONS; ++partitionIndex)
     {
         //clear
-        for (int i = LANE; i < RADIX; i += LANE_COUNT)
-            g_waveHists[i + (WAVE_INDEX << RADIX_LOG)] = 0;
+        {
+            for (int i = LANE; i < RADIX; i += LANE_COUNT)
+                g_waveHists[i + (WAVE_INDEX << RADIX_LOG)] = 0;
+        }
         
         //read
-        const int t = LANE + BIN_SUB_PART_START + BIN_PART_START;
-        uint4 firstKeys;
-        firstKeys.x = b_alt[t];
-        firstKeys.y = b_alt[t + 32];
-        firstKeys.z = b_alt[t + 64];
-        firstKeys.w = b_alt[t + 96];
-        
-        uint4 secKeys;
-        secKeys.x = b_alt[t + 128];
-        secKeys.y = b_alt[t + 160];
-        secKeys.z = b_alt[t + 192];
-        secKeys.w = b_alt[t + 224];
-        
-        //Warp Level Multisplit, manually unrolled
-        uint4 firstOffsets = 0xFFFFFFFF;
-        for (int k = SEC_RADIX; k < THIRD_RADIX; ++k)
+        uint4 keys[BIN_KEY_VECS];
         {
-            const bool4 t = firstKeys >> k & 1;
-            firstOffsets.x &= (t.x ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.x);
-            firstOffsets.y &= (t.y ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.y);
-            firstOffsets.z &= (t.z ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.z);
-            firstOffsets.w &= (t.w ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.w);
+            const int t = LANE + BIN_SUB_PART_START + BIN_PART_START;
+            
+            [unroll]
+            for (int i = 0; i < BIN_KEY_VECS; ++i)
+            {
+                keys[i].x = b_alt[t + (i << 7)];
+                keys[i].y = b_alt[t + (i << 7) + 32];
+                keys[i].z = b_alt[t + (i << 7) + 64];
+                keys[i].w = b_alt[t + (i << 7) + 96];
+            }
         }
         
-        uint4 bits = countbits(firstOffsets << LANE_MASK - LANE);
-        int index = (firstKeys.x >> SEC_RADIX & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        uint prev = g_waveHists[index];
-        if (bits.x == 1)
-            g_waveHists[index] += countbits(firstOffsets.x);
-        firstOffsets.x = prev + bits.x - 1;
-        
-        index = (firstKeys.y >> SEC_RADIX & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.y == 1)
-            g_waveHists[index] += countbits(firstOffsets.y);
-        firstOffsets.y = prev + bits.y - 1;
-        
-        index = (firstKeys.z >> SEC_RADIX & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.z == 1)
-            g_waveHists[index] += countbits(firstOffsets.z);
-        firstOffsets.z = prev + bits.z - 1;
-        
-        index = (firstKeys.w >> SEC_RADIX & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.w == 1)
-            g_waveHists[index] += countbits(firstOffsets.w);
-        firstOffsets.w = prev + bits.w - 1;
-        
-        //Second
-        uint4 secOffsets = 0xFFFFFFFF;
-        for (int k = SEC_RADIX; k < THIRD_RADIX; ++k)
+        //Warp Level Multisplit
+        uint4 offsets[BIN_KEY_VECS];
         {
-            const bool4 t = secKeys >> k & 1;
-            secOffsets.x &= (t.x ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.x);
-            secOffsets.y &= (t.y ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.y);
-            secOffsets.z &= (t.z ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.z);
-            secOffsets.w &= (t.w ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.w);
+            [unroll]
+            for (int i = 0; i < BIN_KEY_VECS; ++i)
+            {
+                offsets[i] = 0xFFFFFFFF;
+
+                [unroll]
+                for (int k = SEC_RADIX; k < THIRD_RADIX; ++k)
+                {
+                    const bool4 t = keys[i] >> k & 1;
+                    offsets[i].x &= (t.x ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.x);
+                    offsets[i].y &= (t.y ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.y);
+                    offsets[i].z &= (t.z ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.z);
+                    offsets[i].w &= (t.w ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.w);
+                }
+                
+                const uint4 bits = countbits(offsets[i] << LANE_MASK - LANE);
+                const uint t = (WAVE_INDEX << RADIX_LOG);
+                
+                [unroll]
+                for (k = 0; k < VEC_SIZE; ++k)
+                {
+                    const int index = (keys[i][k] >> SEC_RADIX & RADIX_MASK) + t;
+                    const uint prev = g_waveHists[index];
+                    if (bits[k] == 1)
+                        g_waveHists[index] += countbits(offsets[i][k]);
+                    offsets[i][k] = prev + bits[k] - 1;
+                }
+            }
         }
-        
-        bits = countbits(secOffsets << LANE_MASK - LANE);
-        index = (secKeys.x >> SEC_RADIX & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.x == 1)
-            g_waveHists[index] += countbits(secOffsets.x);
-        secOffsets.x = prev + bits.x - 1;
-        
-        index = (secKeys.y >> SEC_RADIX & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.y == 1)
-            g_waveHists[index] += countbits(secOffsets.y);
-        secOffsets.y = prev + bits.y - 1;
-        
-        index = (secKeys.z >> SEC_RADIX & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.z == 1)
-            g_waveHists[index] += countbits(secOffsets.z);
-        secOffsets.z = prev + bits.z - 1;
-        
-        index = (secKeys.w >> SEC_RADIX & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.w == 1)
-            g_waveHists[index] += countbits(secOffsets.w);
-        secOffsets.w = prev + bits.w - 1;
         GroupMemoryBarrierWithGroupSync();
         
         //exclusive prefix sum across the histograms, store the reduction for later
         //serial per-thread significantly faster than per wave with intrinsics
-        uint reduction;
+        uint save;
         if (GROUP_THREAD_ID < RADIX)
         {
             const int t = GROUP_THREAD_ID;
@@ -482,7 +417,7 @@ void SecBinningPass(int3 gtid : SV_GroupThreadID)
                 g_waveHists[t] += g_waveHists[k];
                 g_waveHists[k] = g_waveHists[t] - g_waveHists[k];
             }
-            reduction = g_waveHists[t];
+            save = g_waveHists[t];
         }
         GroupMemoryBarrierWithGroupSync();
         
@@ -495,13 +430,12 @@ void SecBinningPass(int3 gtid : SV_GroupThreadID)
             g_waveHists[LANE << LANE_LOG] = WavePrefixSum(g_waveHists[LANE << LANE_LOG]);
         GroupMemoryBarrierWithGroupSync();
 
-        uint decrement;
         if (GROUP_THREAD_ID < RADIX)
         {
             if (LANE)
                 g_waveHists[GROUP_THREAD_ID] += WaveReadLaneAt(g_waveHists[GROUP_THREAD_ID - 1], 1);
-            decrement = g_waveHists[GROUP_THREAD_ID];
-            g_localHist[GROUP_THREAD_ID] -= decrement;
+            save += g_waveHists[GROUP_THREAD_ID];
+            g_localHist[GROUP_THREAD_ID] -= g_waveHists[GROUP_THREAD_ID];
         }
         GroupMemoryBarrierWithGroupSync();
         
@@ -509,66 +443,69 @@ void SecBinningPass(int3 gtid : SV_GroupThreadID)
         if (WAVE_INDEX)
         {
             const uint t = WAVE_INDEX << RADIX_LOG;
-            firstOffsets.x += g_waveHists[(firstKeys.x >> SEC_RADIX & RADIX_MASK) + t] + g_waveHists[firstKeys.x >> SEC_RADIX & RADIX_MASK];
-            firstOffsets.y += g_waveHists[(firstKeys.y >> SEC_RADIX & RADIX_MASK) + t] + g_waveHists[firstKeys.y >> SEC_RADIX & RADIX_MASK];
-            firstOffsets.z += g_waveHists[(firstKeys.z >> SEC_RADIX & RADIX_MASK) + t] + g_waveHists[firstKeys.z >> SEC_RADIX & RADIX_MASK];
-            firstOffsets.w += g_waveHists[(firstKeys.w >> SEC_RADIX & RADIX_MASK) + t] + g_waveHists[firstKeys.w >> SEC_RADIX & RADIX_MASK];
-
-            secOffsets.x += g_waveHists[(secKeys.x >> SEC_RADIX & RADIX_MASK) + t] + g_waveHists[secKeys.x >> SEC_RADIX & RADIX_MASK];
-            secOffsets.y += g_waveHists[(secKeys.y >> SEC_RADIX & RADIX_MASK) + t] + g_waveHists[secKeys.y >> SEC_RADIX & RADIX_MASK];
-            secOffsets.z += g_waveHists[(secKeys.z >> SEC_RADIX & RADIX_MASK) + t] + g_waveHists[secKeys.z >> SEC_RADIX & RADIX_MASK];
-            secOffsets.w += g_waveHists[(secKeys.w >> SEC_RADIX & RADIX_MASK) + t] + g_waveHists[secKeys.w >> SEC_RADIX & RADIX_MASK];
+            
+            [unroll]
+            for (int i = 0; i < BIN_KEY_VECS; ++i)
+            {
+                [unroll]
+                for (int k = 0; k < VEC_SIZE; ++k)
+                {
+                    const uint t2 = keys[i][k] >> SEC_RADIX & RADIX_MASK;
+                    offsets[i][k] += g_waveHists[t2 + t] + g_waveHists[t2];
+                }
+            }
         }
         else
         {
-            firstOffsets.x += g_waveHists[firstKeys.x >> SEC_RADIX & RADIX_MASK];
-            firstOffsets.y += g_waveHists[firstKeys.y >> SEC_RADIX & RADIX_MASK];
-            firstOffsets.z += g_waveHists[firstKeys.z >> SEC_RADIX & RADIX_MASK];
-            firstOffsets.w += g_waveHists[firstKeys.w >> SEC_RADIX & RADIX_MASK];
-
-            secOffsets.x += g_waveHists[secKeys.x >> SEC_RADIX & RADIX_MASK];
-            secOffsets.y += g_waveHists[secKeys.y >> SEC_RADIX & RADIX_MASK];
-            secOffsets.z += g_waveHists[secKeys.z >> SEC_RADIX & RADIX_MASK];
-            secOffsets.w += g_waveHists[secKeys.w >> SEC_RADIX & RADIX_MASK];
+            [unroll]
+            for (int i = 0; i < BIN_KEY_VECS; ++i)
+            {
+                [unroll]
+                for (int k = 0; k < VEC_SIZE; ++k)
+                {
+                    offsets[i][k] += g_waveHists[keys[i][k] >> SEC_RADIX & RADIX_MASK];
+                }
+            }
         }
         GroupMemoryBarrierWithGroupSync();
         
         //Scatter keys into shared memory
-        //For some bizarre reason, this is signicantly faster rolled 
-        for (int i = 0; i < 4; ++i)
         {
-            g_waveHists[firstOffsets[i]] = firstKeys[i];
-            g_waveHists[secOffsets[i]] = secKeys[i];
+            [unroll]
+            for (int i = 0; i < VEC_SIZE; ++i)
+            {
+                g_waveHists[offsets[0][i]] = keys[0][i];
+                g_waveHists[offsets[1][i]] = keys[1][i];
+            }
         }
         GroupMemoryBarrierWithGroupSync();
         
         //Scatter runs of keys into device memory;
-        for (int i = GROUP_THREAD_ID; i < BIN_PART_SIZE; i += BIN_THREADS)
         {
-            firstKeys.x = g_waveHists[i];
-            firstKeys.y = firstKeys.x >> SEC_RADIX & RADIX_MASK;
-            firstKeys.z = g_localHist[firstKeys.y] + i;
-            b_sort[firstKeys.z] = firstKeys.x;
+            for (int i = GROUP_THREAD_ID; i < BIN_PART_SIZE; i += BIN_THREADS)
+                b_sort[g_localHist[g_waveHists[i] >> SEC_RADIX & RADIX_MASK] + i] = g_waveHists[i];
         }
         GroupMemoryBarrierWithGroupSync();
         
         //Update histogram
         if (GROUP_THREAD_ID < RADIX)
-            g_localHist[GROUP_THREAD_ID] += decrement + reduction;
+            g_localHist[GROUP_THREAD_ID] += save;
     }
     GroupMemoryBarrierWithGroupSync();
     
     for (int i = GROUP_THREAD_ID + BIN_PART_START; i < e_size; i += BIN_THREADS)
     {
         const uint key = b_alt[i];
-        
         uint offset = 0xFFFFFFFF;
+        
+        [unroll]
         for (int k = SEC_RADIX; k < THIRD_RADIX; ++k)
         {
             const bool t = key >> k & 1;
             offset &= (t ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t);
         }
         
+        [unroll]
         for (int k = 0; k < BIN_WAVES; ++k)
         {
             if (WAVE_INDEX == k)
@@ -595,99 +532,63 @@ void ThirdBinningPass(int3 gtid : SV_GroupThreadID)
     for (int partitionIndex = 0; partitionIndex < BIN_PARTITIONS; ++partitionIndex)
     {
         //clear
-        for (int i = LANE; i < RADIX; i += LANE_COUNT)
-            g_waveHists[i + (WAVE_INDEX << RADIX_LOG)] = 0;
+        {
+            for (int i = LANE; i < RADIX; i += LANE_COUNT)
+                g_waveHists[i + (WAVE_INDEX << RADIX_LOG)] = 0;
+        }
         
         //read
-        const int t = LANE + BIN_SUB_PART_START + BIN_PART_START;
-        uint4 firstKeys;
-        firstKeys.x = b_sort[t];
-        firstKeys.y = b_sort[t + 32];
-        firstKeys.z = b_sort[t + 64];
-        firstKeys.w = b_sort[t + 96];
-        
-        uint4 secKeys;
-        secKeys.x = b_sort[t + 128];
-        secKeys.y = b_sort[t + 160];
-        secKeys.z = b_sort[t + 192];
-        secKeys.w = b_sort[t + 224];
-        
-        //Warp Level Multisplit, manually unrolled
-        uint4 firstOffsets = 0xFFFFFFFF;
-        for (int k = THIRD_RADIX; k < FOURTH_RADIX; ++k)
+        uint4 keys[BIN_KEY_VECS];
         {
-            const bool4 t = firstKeys >> k & 1;
-            firstOffsets.x &= (t.x ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.x);
-            firstOffsets.y &= (t.y ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.y);
-            firstOffsets.z &= (t.z ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.z);
-            firstOffsets.w &= (t.w ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.w);
+            const int t = LANE + BIN_SUB_PART_START + BIN_PART_START;
+            
+            [unroll]
+            for (int i = 0; i < BIN_KEY_VECS; ++i)
+            {
+                keys[i].x = b_sort[t + (i << 7)];
+                keys[i].y = b_sort[t + (i << 7) + 32];
+                keys[i].z = b_sort[t + (i << 7) + 64];
+                keys[i].w = b_sort[t + (i << 7) + 96];
+            }
         }
         
-        uint4 bits = countbits(firstOffsets << LANE_MASK - LANE);
-        int index = (firstKeys.x >> THIRD_RADIX & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        uint prev = g_waveHists[index];
-        if (bits.x == 1)
-            g_waveHists[index] += countbits(firstOffsets.x);
-        firstOffsets.x = prev + bits.x - 1;
-        
-        index = (firstKeys.y >> THIRD_RADIX & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.y == 1)
-            g_waveHists[index] += countbits(firstOffsets.y);
-        firstOffsets.y = prev + bits.y - 1;
-        
-        index = (firstKeys.z >> THIRD_RADIX & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.z == 1)
-            g_waveHists[index] += countbits(firstOffsets.z);
-        firstOffsets.z = prev + bits.z - 1;
-        
-        index = (firstKeys.w >> THIRD_RADIX & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.w == 1)
-            g_waveHists[index] += countbits(firstOffsets.w);
-        firstOffsets.w = prev + bits.w - 1;
-        
-        //Second
-        uint4 secOffsets = 0xFFFFFFFF;
-        for (int k = THIRD_RADIX; k < FOURTH_RADIX; ++k)
+        //Warp Level Multisplit
+        uint4 offsets[BIN_KEY_VECS];
         {
-            const bool4 t = secKeys >> k & 1;
-            secOffsets.x &= (t.x ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.x);
-            secOffsets.y &= (t.y ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.y);
-            secOffsets.z &= (t.z ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.z);
-            secOffsets.w &= (t.w ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.w);
+            [unroll]
+            for (int i = 0; i < BIN_KEY_VECS; ++i)
+            {
+                offsets[i] = 0xFFFFFFFF;
+
+                [unroll]
+                for (int k = THIRD_RADIX; k < FOURTH_RADIX; ++k)
+                {
+                    const bool4 t = keys[i] >> k & 1;
+                    offsets[i].x &= (t.x ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.x);
+                    offsets[i].y &= (t.y ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.y);
+                    offsets[i].z &= (t.z ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.z);
+                    offsets[i].w &= (t.w ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.w);
+                }
+                
+                const uint4 bits = countbits(offsets[i] << LANE_MASK - LANE);
+                const uint t = (WAVE_INDEX << RADIX_LOG);
+                
+                [unroll]
+                for (k = 0; k < VEC_SIZE; ++k)
+                {
+                    const int index = (keys[i][k] >> THIRD_RADIX & RADIX_MASK) + t;
+                    const uint prev = g_waveHists[index];
+                    if (bits[k] == 1)
+                        g_waveHists[index] += countbits(offsets[i][k]);
+                    offsets[i][k] = prev + bits[k] - 1;
+                }
+            }
         }
-        
-        bits = countbits(secOffsets << LANE_MASK - LANE);
-        index = (secKeys.x >> THIRD_RADIX & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.x == 1)
-            g_waveHists[index] += countbits(secOffsets.x);
-        secOffsets.x = prev + bits.x - 1;
-        
-        index = (secKeys.y >> THIRD_RADIX & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.y == 1)
-            g_waveHists[index] += countbits(secOffsets.y);
-        secOffsets.y = prev + bits.y - 1;
-        
-        index = (secKeys.z >> THIRD_RADIX & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.z == 1)
-            g_waveHists[index] += countbits(secOffsets.z);
-        secOffsets.z = prev + bits.z - 1;
-        
-        index = (secKeys.w >> THIRD_RADIX & RADIX_MASK) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.w == 1)
-            g_waveHists[index] += countbits(secOffsets.w);
-        secOffsets.w = prev + bits.w - 1;
         GroupMemoryBarrierWithGroupSync();
         
         //exclusive prefix sum across the histograms, store the reduction for later
         //serial per-thread significantly faster than per wave with intrinsics
-        uint reduction;
+        uint save;
         if (GROUP_THREAD_ID < RADIX)
         {
             const int t = GROUP_THREAD_ID;
@@ -696,7 +597,7 @@ void ThirdBinningPass(int3 gtid : SV_GroupThreadID)
                 g_waveHists[t] += g_waveHists[k];
                 g_waveHists[k] = g_waveHists[t] - g_waveHists[k];
             }
-            reduction = g_waveHists[t];
+            save = g_waveHists[t];
         }
         GroupMemoryBarrierWithGroupSync();
         
@@ -709,13 +610,12 @@ void ThirdBinningPass(int3 gtid : SV_GroupThreadID)
             g_waveHists[LANE << LANE_LOG] = WavePrefixSum(g_waveHists[LANE << LANE_LOG]);
         GroupMemoryBarrierWithGroupSync();
 
-        uint decrement;
         if (GROUP_THREAD_ID < RADIX)
         {
             if (LANE)
                 g_waveHists[GROUP_THREAD_ID] += WaveReadLaneAt(g_waveHists[GROUP_THREAD_ID - 1], 1);
-            decrement = g_waveHists[GROUP_THREAD_ID];
-            g_localHist[GROUP_THREAD_ID] -= decrement;
+            save += g_waveHists[GROUP_THREAD_ID];
+            g_localHist[GROUP_THREAD_ID] -= g_waveHists[GROUP_THREAD_ID];
         }
         GroupMemoryBarrierWithGroupSync();
         
@@ -723,66 +623,69 @@ void ThirdBinningPass(int3 gtid : SV_GroupThreadID)
         if (WAVE_INDEX)
         {
             const uint t = WAVE_INDEX << RADIX_LOG;
-            firstOffsets.x += g_waveHists[(firstKeys.x >> THIRD_RADIX & RADIX_MASK) + t] + g_waveHists[firstKeys.x >> THIRD_RADIX & RADIX_MASK];
-            firstOffsets.y += g_waveHists[(firstKeys.y >> THIRD_RADIX & RADIX_MASK) + t] + g_waveHists[firstKeys.y >> THIRD_RADIX & RADIX_MASK];
-            firstOffsets.z += g_waveHists[(firstKeys.z >> THIRD_RADIX & RADIX_MASK) + t] + g_waveHists[firstKeys.z >> THIRD_RADIX & RADIX_MASK];
-            firstOffsets.w += g_waveHists[(firstKeys.w >> THIRD_RADIX & RADIX_MASK) + t] + g_waveHists[firstKeys.w >> THIRD_RADIX & RADIX_MASK];
-
-            secOffsets.x += g_waveHists[(secKeys.x >> THIRD_RADIX & RADIX_MASK) + t] + g_waveHists[secKeys.x >> THIRD_RADIX & RADIX_MASK];
-            secOffsets.y += g_waveHists[(secKeys.y >> THIRD_RADIX & RADIX_MASK) + t] + g_waveHists[secKeys.y >> THIRD_RADIX & RADIX_MASK];
-            secOffsets.z += g_waveHists[(secKeys.z >> THIRD_RADIX & RADIX_MASK) + t] + g_waveHists[secKeys.z >> THIRD_RADIX & RADIX_MASK];
-            secOffsets.w += g_waveHists[(secKeys.w >> THIRD_RADIX & RADIX_MASK) + t] + g_waveHists[secKeys.w >> THIRD_RADIX & RADIX_MASK];
+            
+            [unroll]
+            for (int i = 0; i < BIN_KEY_VECS; ++i)
+            {
+                [unroll]
+                for (int k = 0; k < VEC_SIZE; ++k)
+                {
+                    const uint t2 = keys[i][k] >> THIRD_RADIX & RADIX_MASK;
+                    offsets[i][k] += g_waveHists[t2 + t] + g_waveHists[t2];
+                }
+            }
         }
         else
         {
-            firstOffsets.x += g_waveHists[firstKeys.x >> THIRD_RADIX & RADIX_MASK];
-            firstOffsets.y += g_waveHists[firstKeys.y >> THIRD_RADIX & RADIX_MASK];
-            firstOffsets.z += g_waveHists[firstKeys.z >> THIRD_RADIX & RADIX_MASK];
-            firstOffsets.w += g_waveHists[firstKeys.w >> THIRD_RADIX & RADIX_MASK];
-
-            secOffsets.x += g_waveHists[secKeys.x >> THIRD_RADIX & RADIX_MASK];
-            secOffsets.y += g_waveHists[secKeys.y >> THIRD_RADIX & RADIX_MASK];
-            secOffsets.z += g_waveHists[secKeys.z >> THIRD_RADIX & RADIX_MASK];
-            secOffsets.w += g_waveHists[secKeys.w >> THIRD_RADIX & RADIX_MASK];
+            [unroll]
+            for (int i = 0; i < BIN_KEY_VECS; ++i)
+            {
+                [unroll]
+                for (int k = 0; k < VEC_SIZE; ++k)
+                {
+                    offsets[i][k] += g_waveHists[keys[i][k] >> THIRD_RADIX & RADIX_MASK];
+                }
+            }
         }
         GroupMemoryBarrierWithGroupSync();
         
         //Scatter keys into shared memory
-        //For some bizarre reason, this is signicantly faster rolled 
-        for (int i = 0; i < 4; ++i)
         {
-            g_waveHists[firstOffsets[i]] = firstKeys[i];
-            g_waveHists[secOffsets[i]] = secKeys[i];
+            [unroll]
+            for (int i = 0; i < VEC_SIZE; ++i)
+            {
+                g_waveHists[offsets[0][i]] = keys[0][i];
+                g_waveHists[offsets[1][i]] = keys[1][i];
+            }
         }
         GroupMemoryBarrierWithGroupSync();
         
-        //Scatter runs of keys into device memory;
-        for (int i = GROUP_THREAD_ID; i < BIN_PART_SIZE; i += BIN_THREADS)
+        //Scatter runs of keys into device memory
         {
-            firstKeys.x = g_waveHists[i];
-            firstKeys.y = firstKeys.x >> THIRD_RADIX & RADIX_MASK;
-            firstKeys.z = g_localHist[firstKeys.y] + i;
-            b_alt[firstKeys.z] = firstKeys.x;
+            for (int i = GROUP_THREAD_ID; i < BIN_PART_SIZE; i += BIN_THREADS)
+                b_alt[g_localHist[g_waveHists[i] >> THIRD_RADIX & RADIX_MASK] + i] = g_waveHists[i];
         }
         GroupMemoryBarrierWithGroupSync();
         
         //Update histogram
         if (GROUP_THREAD_ID < RADIX)
-            g_localHist[GROUP_THREAD_ID] += decrement + reduction;
+            g_localHist[GROUP_THREAD_ID] += save;
     }
     GroupMemoryBarrierWithGroupSync();
     
     for (int i = GROUP_THREAD_ID + BIN_PART_START; i < e_size; i += BIN_THREADS)
     {
         const uint key = b_sort[i];
-        
         uint offset = 0xFFFFFFFF;
+        
+        [unroll]
         for (int k = THIRD_RADIX; k < FOURTH_RADIX; ++k)
         {
             const bool t = key >> k & 1;
             offset &= (t ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t);
         }
         
+        [unroll]
         for (int k = 0; k < BIN_WAVES; ++k)
         {
             if (WAVE_INDEX == k)
@@ -809,99 +712,63 @@ void FourthBinningPass(int3 gtid : SV_GroupThreadID)
     for (int partitionIndex = 0; partitionIndex < BIN_PARTITIONS; ++partitionIndex)
     {
         //clear
-        for (int i = LANE; i < RADIX; i += LANE_COUNT)
-            g_waveHists[i + (WAVE_INDEX << RADIX_LOG)] = 0;
+        {
+            for (int i = LANE; i < RADIX; i += LANE_COUNT)
+                g_waveHists[i + (WAVE_INDEX << RADIX_LOG)] = 0;
+        }
         
         //read
-        const int t = LANE + BIN_SUB_PART_START + BIN_PART_START;
-        uint4 firstKeys;
-        firstKeys.x = b_alt[t];
-        firstKeys.y = b_alt[t + 32];
-        firstKeys.z = b_alt[t + 64];
-        firstKeys.w = b_alt[t + 96];
-        
-        uint4 secKeys;
-        secKeys.x = b_alt[t + 128];
-        secKeys.y = b_alt[t + 160];
-        secKeys.z = b_alt[t + 192];
-        secKeys.w = b_alt[t + 224];
-        
-        //Warp Level Multisplit, manually unrolled
-        uint4 firstOffsets = 0xFFFFFFFF;
-        for (int k = FOURTH_RADIX; k < 32; ++k)
+        uint4 keys[BIN_KEY_VECS];
         {
-            const bool4 t = firstKeys >> k & 1;
-            firstOffsets.x &= (t.x ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.x);
-            firstOffsets.y &= (t.y ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.y);
-            firstOffsets.z &= (t.z ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.z);
-            firstOffsets.w &= (t.w ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.w);
+            const int t = LANE + BIN_SUB_PART_START + BIN_PART_START;
+            
+            [unroll]
+            for (int i = 0; i < BIN_KEY_VECS; ++i)
+            {
+                keys[i].x = b_alt[t + (i << 7)];
+                keys[i].y = b_alt[t + (i << 7) + 32];
+                keys[i].z = b_alt[t + (i << 7) + 64];
+                keys[i].w = b_alt[t + (i << 7) + 96];
+            }
         }
         
-        uint4 bits = countbits(firstOffsets << LANE_MASK - LANE);
-        int index = (firstKeys.x >> FOURTH_RADIX) + (WAVE_INDEX << RADIX_LOG);
-        uint prev = g_waveHists[index];
-        if (bits.x == 1)
-            g_waveHists[index] += countbits(firstOffsets.x);
-        firstOffsets.x = prev + bits.x - 1;
-        
-        index = (firstKeys.y >> FOURTH_RADIX) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.y == 1)
-            g_waveHists[index] += countbits(firstOffsets.y);
-        firstOffsets.y = prev + bits.y - 1;
-        
-        index = (firstKeys.z >> FOURTH_RADIX) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.z == 1)
-            g_waveHists[index] += countbits(firstOffsets.z);
-        firstOffsets.z = prev + bits.z - 1;
-        
-        index = (firstKeys.w >> FOURTH_RADIX) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.w == 1)
-            g_waveHists[index] += countbits(firstOffsets.w);
-        firstOffsets.w = prev + bits.w - 1;
-        
-        //Second
-        uint4 secOffsets = 0xFFFFFFFF;
-        for (int k = FOURTH_RADIX; k < 32; ++k)
+        //Warp Level Multisplit
+        uint4 offsets[BIN_KEY_VECS];
         {
-            const bool4 t = secKeys >> k & 1;
-            secOffsets.x &= (t.x ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.x);
-            secOffsets.y &= (t.y ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.y);
-            secOffsets.z &= (t.z ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.z);
-            secOffsets.w &= (t.w ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.w);
+            [unroll]
+            for (int i = 0; i < BIN_KEY_VECS; ++i)
+            {
+                offsets[i] = 0xFFFFFFFF;
+
+                [unroll]
+                for (int k = FOURTH_RADIX; k < 32; ++k)
+                {
+                    const bool4 t = keys[i] >> k & 1;
+                    offsets[i].x &= (t.x ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.x);
+                    offsets[i].y &= (t.y ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.y);
+                    offsets[i].z &= (t.z ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.z);
+                    offsets[i].w &= (t.w ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t.w);
+                }
+                
+                const uint4 bits = countbits(offsets[i] << LANE_MASK - LANE);
+                const uint t = (WAVE_INDEX << RADIX_LOG);
+                
+                [unroll]
+                for (k = 0; k < VEC_SIZE; ++k)
+                {
+                    const int index = (keys[i][k] >> FOURTH_RADIX) + t;
+                    const uint prev = g_waveHists[index];
+                    if (bits[k] == 1)
+                        g_waveHists[index] += countbits(offsets[i][k]);
+                    offsets[i][k] = prev + bits[k] - 1;
+                }
+            }
         }
-        
-        bits = countbits(secOffsets << LANE_MASK - LANE);
-        index = (secKeys.x >> FOURTH_RADIX) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.x == 1)
-            g_waveHists[index] += countbits(secOffsets.x);
-        secOffsets.x = prev + bits.x - 1;
-        
-        index = (secKeys.y >> FOURTH_RADIX) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.y == 1)
-            g_waveHists[index] += countbits(secOffsets.y);
-        secOffsets.y = prev + bits.y - 1;
-        
-        index = (secKeys.z >> FOURTH_RADIX) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.z == 1)
-            g_waveHists[index] += countbits(secOffsets.z);
-        secOffsets.z = prev + bits.z - 1;
-        
-        index = (secKeys.w >> FOURTH_RADIX) + (WAVE_INDEX << RADIX_LOG);
-        prev = g_waveHists[index];
-        if (bits.w == 1)
-            g_waveHists[index] += countbits(secOffsets.w);
-        secOffsets.w = prev + bits.w - 1;
         GroupMemoryBarrierWithGroupSync();
         
         //exclusive prefix sum across the histograms, store the reduction for later
         //serial per-thread significantly faster than per wave with intrinsics
-        uint reduction;
+        uint save;
         if (GROUP_THREAD_ID < RADIX)
         {
             const int t = GROUP_THREAD_ID;
@@ -910,7 +777,7 @@ void FourthBinningPass(int3 gtid : SV_GroupThreadID)
                 g_waveHists[t] += g_waveHists[k];
                 g_waveHists[k] = g_waveHists[t] - g_waveHists[k];
             }
-            reduction = g_waveHists[t];
+            save = g_waveHists[t];
         }
         GroupMemoryBarrierWithGroupSync();
         
@@ -923,13 +790,12 @@ void FourthBinningPass(int3 gtid : SV_GroupThreadID)
             g_waveHists[LANE << LANE_LOG] = WavePrefixSum(g_waveHists[LANE << LANE_LOG]);
         GroupMemoryBarrierWithGroupSync();
 
-        uint decrement;
         if (GROUP_THREAD_ID < RADIX)
         {
             if (LANE)
                 g_waveHists[GROUP_THREAD_ID] += WaveReadLaneAt(g_waveHists[GROUP_THREAD_ID - 1], 1);
-            decrement = g_waveHists[GROUP_THREAD_ID];
-            g_localHist[GROUP_THREAD_ID] -= decrement;
+            save += g_waveHists[GROUP_THREAD_ID];
+            g_localHist[GROUP_THREAD_ID] -= g_waveHists[GROUP_THREAD_ID];
         }
         GroupMemoryBarrierWithGroupSync();
         
@@ -937,66 +803,69 @@ void FourthBinningPass(int3 gtid : SV_GroupThreadID)
         if (WAVE_INDEX)
         {
             const uint t = WAVE_INDEX << RADIX_LOG;
-            firstOffsets.x += g_waveHists[(firstKeys.x >> FOURTH_RADIX) + t] + g_waveHists[firstKeys.x >> FOURTH_RADIX];
-            firstOffsets.y += g_waveHists[(firstKeys.y >> FOURTH_RADIX) + t] + g_waveHists[firstKeys.y >> FOURTH_RADIX];
-            firstOffsets.z += g_waveHists[(firstKeys.z >> FOURTH_RADIX) + t] + g_waveHists[firstKeys.z >> FOURTH_RADIX];
-            firstOffsets.w += g_waveHists[(firstKeys.w >> FOURTH_RADIX) + t] + g_waveHists[firstKeys.w >> FOURTH_RADIX];
-
-            secOffsets.x += g_waveHists[(secKeys.x >> FOURTH_RADIX) + t] + g_waveHists[secKeys.x >> FOURTH_RADIX];
-            secOffsets.y += g_waveHists[(secKeys.y >> FOURTH_RADIX) + t] + g_waveHists[secKeys.y >> FOURTH_RADIX];
-            secOffsets.z += g_waveHists[(secKeys.z >> FOURTH_RADIX) + t] + g_waveHists[secKeys.z >> FOURTH_RADIX];
-            secOffsets.w += g_waveHists[(secKeys.w >> FOURTH_RADIX) + t] + g_waveHists[secKeys.w >> FOURTH_RADIX];
+            
+            [unroll]
+            for (int i = 0; i < BIN_KEY_VECS; ++i)
+            {
+                [unroll]
+                for (int k = 0; k < VEC_SIZE; ++k)
+                {
+                    const uint t2 = keys[i][k] >> FOURTH_RADIX;
+                    offsets[i][k] += g_waveHists[t2 + t] + g_waveHists[t2];
+                }
+            }
         }
         else
         {
-            firstOffsets.x += g_waveHists[firstKeys.x >> FOURTH_RADIX];
-            firstOffsets.y += g_waveHists[firstKeys.y >> FOURTH_RADIX];
-            firstOffsets.z += g_waveHists[firstKeys.z >> FOURTH_RADIX];
-            firstOffsets.w += g_waveHists[firstKeys.w >> FOURTH_RADIX];
-
-            secOffsets.x += g_waveHists[secKeys.x >> FOURTH_RADIX];
-            secOffsets.y += g_waveHists[secKeys.y >> FOURTH_RADIX];
-            secOffsets.z += g_waveHists[secKeys.z >> FOURTH_RADIX];
-            secOffsets.w += g_waveHists[secKeys.w >> FOURTH_RADIX];
+            [unroll]
+            for (int i = 0; i < BIN_KEY_VECS; ++i)
+            {
+                [unroll]
+                for (int k = 0; k < VEC_SIZE; ++k)
+                {
+                    offsets[i][k] += g_waveHists[keys[i][k] >> FOURTH_RADIX];
+                }
+            }
         }
         GroupMemoryBarrierWithGroupSync();
         
         //Scatter keys into shared memory
-        //For some bizarre reason, this is signicantly faster rolled 
-        for (int i = 0; i < 4; ++i)
         {
-            g_waveHists[firstOffsets[i]] = firstKeys[i];
-            g_waveHists[secOffsets[i]] = secKeys[i];
+            [unroll]
+            for (int i = 0; i < VEC_SIZE; ++i)
+            {
+                g_waveHists[offsets[0][i]] = keys[0][i];
+                g_waveHists[offsets[1][i]] = keys[1][i];
+            }
         }
         GroupMemoryBarrierWithGroupSync();
         
         //Scatter runs of keys into device memory;
-        for (int i = GROUP_THREAD_ID; i < BIN_PART_SIZE; i += BIN_THREADS)
         {
-            firstKeys.x = g_waveHists[i];
-            firstKeys.y = firstKeys.x >> FOURTH_RADIX;
-            firstKeys.z = g_localHist[firstKeys.y] + i;
-            b_sort[firstKeys.z] = firstKeys.x;
+            for (int i = GROUP_THREAD_ID; i < BIN_PART_SIZE; i += BIN_THREADS)
+                b_sort[g_localHist[g_waveHists[i] >> FOURTH_RADIX] + i] = g_waveHists[i];
         }
         GroupMemoryBarrierWithGroupSync();
         
         //Update histogram
         if (GROUP_THREAD_ID < RADIX)
-            g_localHist[GROUP_THREAD_ID] += decrement + reduction;
+            g_localHist[GROUP_THREAD_ID] += save;
     }
     GroupMemoryBarrierWithGroupSync();
     
     for (int i = GROUP_THREAD_ID + BIN_PART_START; i < e_size; i += BIN_THREADS)
     {
         const uint key = b_alt[i];
-        
         uint offset = 0xFFFFFFFF;
+        
+        [unroll]
         for (int k = FOURTH_RADIX; k < 32; ++k)
         {
             const bool t = key >> k & 1;
             offset &= (t ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t);
         }
         
+        [unroll]
         for (int k = 0; k < BIN_WAVES; ++k)
         {
             if (WAVE_INDEX == k)

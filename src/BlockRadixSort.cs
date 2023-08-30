@@ -14,7 +14,7 @@ public class BlockRadixSort : MonoBehaviour
         //Validates the sort at the current input size on a randomly generated bag of integers
         ValidateRandom,
 
-        //Times the execution of the a single digit binning pass
+        //Times the execution of a single digit binning pass
         SinglePassTimingTest,
 
         //Times the execution of the entire algorithm
@@ -142,7 +142,7 @@ public class BlockRadixSort : MonoBehaviour
     {
         try
         {
-            compute.FindKernel("InitBlockRadixSort");
+            compute.FindKernel("Init" + computeShaderString);
         }
         catch
         {
@@ -206,6 +206,15 @@ public class BlockRadixSort : MonoBehaviour
         compute.SetBuffer(k_scatterFour, "b_timing", timingBuffer);
     }
 
+    private void DispatchKernels()
+    {
+        compute.Dispatch(k_globalHist, 1, 1, 1);
+        compute.Dispatch(k_scatterOne, 1, 1, 1);
+        compute.Dispatch(k_scatterTwo, 1, 1, 1);
+        compute.Dispatch(k_scatterThree, 1, 1, 1);
+        compute.Dispatch(k_scatterFour, 1, 1, 1);
+    }
+
     private void ResetBuffers()
     {
         compute.Dispatch(k_init, 256, 1, 1);
@@ -221,17 +230,7 @@ public class BlockRadixSort : MonoBehaviour
     {
         breaker = false;
         validationArray = new uint[_size];
-
-        compute.Dispatch(k_globalHist, 1, 1, 1);
-
-        compute.Dispatch(k_scatterOne, 1, 1, 1);
-
-        compute.Dispatch(k_scatterTwo, 1, 1, 1);
-
-        compute.Dispatch(k_scatterThree, 1, 1, 1);
-
-        compute.Dispatch(k_scatterFour, 1, 1, 1);
-
+        DispatchKernels();
         sortBuffer.GetData(validationArray);
         yield return new WaitForSeconds(.25f);  //To prevent unity from crashing
 
@@ -244,17 +243,7 @@ public class BlockRadixSort : MonoBehaviour
         breaker = false;
         validationArray = new uint[_size];
         ResetBuffersRandom();
-
-        compute.Dispatch(k_globalHist, 1, 1, 1);
-
-        compute.Dispatch(k_scatterOne, 1, 1, 1);
-
-        compute.Dispatch(k_scatterTwo, 1, 1, 1);
-
-        compute.Dispatch(k_scatterThree, 1, 1, 1);
-
-        compute.Dispatch(k_scatterFour, 1, 1, 1);
-
+        DispatchKernels();
         sortBuffer.GetData(validationArray);
         yield return new WaitForSeconds(.25f);  //To prevent unity from crashing
 
@@ -290,16 +279,7 @@ public class BlockRadixSort : MonoBehaviour
         yield return new WaitUntil(() => request.done);
 
         float time = Time.realtimeSinceStartup;
-        compute.Dispatch(k_globalHist, 1, 1, 1);
-
-        compute.Dispatch(k_scatterOne, 1, 1, 1);
-
-        compute.Dispatch(k_scatterTwo, 1, 1, 1);
-
-        compute.Dispatch(k_scatterThree, 1, 1, 1);
-
-        compute.Dispatch(k_scatterFour, 1, 1, 1);
-
+        DispatchKernels();
         request = AsyncGPUReadback.Request(timingBuffer);
         yield return new WaitUntil(() => request.done);
         time = Time.realtimeSinceStartup - time;
@@ -319,16 +299,7 @@ public class BlockRadixSort : MonoBehaviour
         yield return new WaitUntil(() => request.done);
 
         float time = Time.realtimeSinceStartup;
-        compute.Dispatch(k_globalHist, 1, 1, 1);
-
-        compute.Dispatch(k_scatterOne, 1, 1, 1);
-
-        compute.Dispatch(k_scatterTwo, 1, 1, 1);
-
-        compute.Dispatch(k_scatterThree, 1, 1, 1);
-
-        compute.Dispatch(k_scatterFour, 1, 1, 1);
-
+        DispatchKernels();
         request = AsyncGPUReadback.Request(timingBuffer);
         yield return new WaitUntil(() => request.done);
         time = Time.realtimeSinceStartup - time;
@@ -356,17 +327,7 @@ public class BlockRadixSort : MonoBehaviour
             yield return new WaitUntil(() => request.done);
 
             time = Time.realtimeSinceStartup;
-
-            compute.Dispatch(k_globalHist, 1, 1, 1);
-
-            compute.Dispatch(k_scatterOne, 1, 1, 1);
-
-            compute.Dispatch(k_scatterTwo, 1, 1, 1);
-
-            compute.Dispatch(k_scatterThree, 1, 1, 1);
-
-            compute.Dispatch(k_scatterFour, 1, 1, 1);
-
+            DispatchKernels();
             request = AsyncGPUReadback.Request(timingBuffer);
             yield return new WaitUntil(() => request.done);
             time = Time.realtimeSinceStartup - time;
@@ -432,7 +393,7 @@ public class BlockRadixSort : MonoBehaviour
                     errCount++;
 
                 if (errCount < 1024)
-                    Debug.LogError("EXPECTED SAME AT INDEX " + i + ": " + (i + 1) + ", " + validationArray[i]);
+                    Debug.LogError("ERROR AT INDEX " + i + ": " + validationArray[i - 1] + ", " + validationArray[i]);
             }
         }
 
