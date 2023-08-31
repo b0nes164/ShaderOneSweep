@@ -1,0 +1,1169 @@
+/******************************************************************************
+ * OneSweep for key value pairs
+ * 
+ * Author:  Thomas Smith 8/31/2023
+ *
+ * Based off of Research by:
+ *          Andy Adinets, Nvidia Corporation
+ *          Duane Merrill, Nvidia Corporation
+ *          https://research.nvidia.com/publication/2022-06_onesweep-faster-least-significant-digit-radix-sort-gpus
+ *
+ * Copyright (c) 2011, Duane Merrill.  All rights reserved.
+ * Copyright (c) 2011-2023, NVIDIA CORPORATION.  All rights reserved.
+ *
+ * Redistribution and use in source and binary forms, with or without
+ * modification, are permitted provided that the following conditions are met:
+ *     * Redistributions of source code must retain the above copyright
+ *       notice, this list of conditions and the following disclaimer.
+ *     * Redistributions in binary form must reproduce the above copyright
+ *       notice, this list of conditions and the following disclaimer in the
+ *       documentation and/or other materials provided with the distribution.
+ *     * Neither the name of the NVIDIA CORPORATION nor the
+ *       names of its contributors may be used to endorse or promote products
+ *       derived from this software without specific prior written permission.
+ *
+ * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
+ * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
+ * WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+ * DISCLAIMED. IN NO EVENT SHALL NVIDIA CORPORATION BE LIABLE FOR ANY
+ * DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES
+ * (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+ * LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND
+ * ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+ * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+ * SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+ *
+ ******************************************************************************/
+#pragma use_dxc
+#pragma kernel InitOneSweepKeyValue
+#pragma kernel InitRandom
+#pragma kernel InitStability
+#pragma kernel GlobalHistogram 
+#pragma kernel FirstBinningPass
+#pragma kernel SecBinningPass
+#pragma kernel ThirdBinningPass
+#pragma kernel FourthBinningPass
+
+//General macros 
+#define LANE_COUNT          32      //Lane count in wave, Nvidia hardware
+#define LANE_MASK           31      //Mask of the lane count
+#define LANE_LOG            5       //log2(LANE_COUNT)
+
+#define RADIX               256     //Number of digit bins
+#define RADIX_MASK          255     //Mask of digit bins
+#define RADIX_LOG           8       //log2(RADIX)
+#define SEC_RADIX           8       //Shift value to retrieve digits from the second place
+#define THIRD_RADIX         16      //Shift value to retrieve digits from the third place
+#define FOURTH_RADIX        24      //Shift value to retrieve digits from the fourth place 
+#define SEC_RADIX_START     256     //Offset for retrieving values from global buffer
+#define THIRD_RADIX_START   512     //Offset for retrieving values from global buffer
+#define FOURTH_RADIX_START  768     //Offset for retrieving values from global buffer
+
+#define LANE                gtid.x                                  //The lane of a thread
+#define WAVE_INDEX          gtid.y                                  //The wave of a thread
+#define GROUP_THREAD_ID     (LANE + (WAVE_INDEX << LANE_LOG))       //The group relative thread id
+
+//For the upfront global histogram kernel
+#define G_HIST_WAVES        2                                       //The number of waves in a GlobalHistogram threadblock
+#define G_HIST_THREADS      64                                      //The number of threads in a GlobalHistogram threadblock
+#define G_HIST_TBLOCKS      2048                                    //The number of threadblocks dispatched for the GlobalHistogram kernel
+#define G_HIST_PART_SIZE    (e_size / G_HIST_TBLOCKS)               //The partition tile size of a GlobalHistogram threadblock
+#define G_HIST_PART_START   (gid.x * G_HIST_PART_SIZE)              //The starting offset of a partition tile
+#define G_HIST_PART_END     (gid.x == G_HIST_TBLOCKS - 1 ? \
+                            e_size : (gid.x + 1) * G_HIST_PART_SIZE)
+
+//For the binning
+#define BIN_PART_SIZE       7680    //The partition tile size of a BinningPass threadblock
+#define BIN_HISTS_SIZE      4096    //The total size of all wave histograms in shared memory
+#define BIN_TBLOCKS         512     //The number of threadblocks dispatched in a BinningPass threadblock
+#define BIN_THREADS         512     //The number of threads in a BinningPass threadblock
+#define BIN_SUB_PART_SIZE   480     //The subpartition tile size of a single wave in a BinningPass threadblock
+#define BIN_WAVES           16      //The number of waves in a BinningPass threadblock
+#define BIN_KEYS_PER_THREAD 15      //The number of keys per thread in BinningPass threadblock
+
+#define FLAG_NOT_READY      0       //Flag value inidicating neither inclusive sum, or aggregate sum of a partition tile is ready
+#define FLAG_AGGREGATE      1       //Flag value indicating aggregate sum of a partition tile is ready
+#define FLAG_INCLUSIVE      2       //Flag value indicating inclusive sum of a partition tile is ready
+#define FLAG_MASK           3       //Mask used to retrieve flag values
+
+#define BIN_PARTITIONS     (e_size / BIN_PART_SIZE)             //The number of partition tiles in a BinningPass
+#define BIN_SUB_PART_START (WAVE_INDEX * BIN_SUB_PART_SIZE)     //The starting offset of a subpartition tile
+#define BIN_PART_START     (partitionIndex * BIN_PART_SIZE)     //The starting offset of a partition tile
+
+//Hybrid LCG-Tausworthe PRNG
+//From GPU GEMS 3, Chapter 37
+//Authors: Lee Howes and David Thomas 
+#define TAUS_STEP_1         ((z1 & 4294967294U) << 12) ^ (((z1 << 13) ^ z1) >> 19)
+#define TAUS_STEP_2         ((z2 & 4294967288U) << 4) ^ (((z2 << 2) ^ z2) >> 25)
+#define TAUS_STEP_3         ((z3 & 4294967280U) << 17) ^ (((z3 << 3) ^ z3) >> 11)
+#define LCG_STEP            (z4 * 1664525 + 1013904223U)
+#define HYBRID_TAUS         ((z1 ^ z2 ^ z3 ^ z4) & 268435455)
+
+extern int e_size;                                              //Input size, passed in from CPU
+extern uint e_seed;                                             //Seed for PRNGS, passed in from CPU
+
+RWBuffer<uint> b_sort;                                          //buffer to be sorted
+RWBuffer<uint> b_sortPayload;                                   //payload buffer
+RWBuffer<uint> b_alt;                                           //double buffer
+RWBuffer<uint> b_altPayload;                                    //alt payload buffer
+RWBuffer<uint> b_globalHist;                                    //buffer holding device level offsets for each binning pass
+RWBuffer<uint> b_timing;                                        //To time the execution of the kernels
+
+globallycoherent RWBuffer<uint> b_index;                        //buffer used to atomically assign partition tiles to threadblocks, see Chained Scan with Decoupled Lookback repo, Deadlocking section
+globallycoherent RWBuffer<uint> b_passHist;                     //buffer used to store reduced sums of partition tiles
+globallycoherent RWBuffer<uint> b_passTwo;                      //buffer used to store reduced sums of partition tiles
+globallycoherent RWBuffer<uint> b_passThree;                    //buffer used to store reduced sums of partition tiles
+globallycoherent RWBuffer<uint> b_passFour;                     //buffer used to store reduced sums of partition tiles
+
+groupshared uint4 g_globalHist[RADIX];                          //Shared memory for performing the upfront global histogram
+groupshared uint g_localHist[RADIX];                            //Threadgroup copy of globalHist during digit binning passes
+groupshared uint g_waveHists[BIN_PART_SIZE];                    //Shared memory for the per wave histograms during digit binning passes
+groupshared uint g_reductionHist[RADIX];                        //Shared memory for reduced per wave histograms during digit binning pass
+
+[numthreads(1024, 1, 1)]
+void InitOneSweepKeyValue(int3 id : SV_DispatchThreadID)
+{
+    for (int i = id.x; i < e_size; i += 1024 * 256)
+    {
+        b_sort[i] = e_size - i;
+        b_sortPayload[i] = e_size - i;
+    }
+    
+    if (id.x < 1024)
+        b_globalHist[id.x] = 0;
+        
+    if (id.x < 4)
+        b_index[id.x] = 0;
+
+    const int size = BIN_PARTITIONS << RADIX_LOG;
+    for (int i = id.x; i < size; i += 1024 * 256)
+    {
+        b_passHist[i] = 0;
+        b_passTwo[i] = 0;
+        b_passThree[i] = 0;
+        b_passFour[i] = 0;
+    }
+}
+
+[numthreads(1024, 1, 1)]
+void InitRandom(int3 id : SV_DispatchThreadID)
+{
+    uint z1 = (id.x << 2) * e_seed;
+    uint z2 = ((id.x << 2) + 1) * e_seed;
+    uint z3 = ((id.x << 2) + 2) * e_seed;
+    uint z4 = ((id.x << 2) + 3) * e_seed;
+    
+    for (int i = id.x; i < e_size; i += 1024 * 256)
+    {
+        z1 = TAUS_STEP_1;
+        z2 = TAUS_STEP_2;
+        z3 = TAUS_STEP_3;
+        z4 = LCG_STEP;
+        const uint t = HYBRID_TAUS;
+        b_sort[i] = t;
+        b_sortPayload[i] = t;
+    }
+    
+    if (id.x < 1024)
+        b_globalHist[id.x] = 0;
+    
+    if (id.x < 4)
+        b_index[id.x] = 0;
+
+    const int size = BIN_PARTITIONS << RADIX_LOG;
+    for (int i = id.x; i < size; i += 1024 * 256)
+    {
+        b_passHist[i] = 0;
+        b_passTwo[i] = 0;
+        b_passThree[i] = 0;
+        b_passFour[i] = 0;
+    }
+}
+
+[numthreads(1024, 1, 1)]
+void InitStability(int3 id : SV_DispatchThreadID)
+{
+    for (int i = id.x; i < e_size; i += 1024 * 256)
+    {
+        b_sort[i] = 1;
+        b_sortPayload[i] = i + 1;
+    }
+    
+    if (id.x < 1024)
+        b_globalHist[id.x] = 0;
+        
+    if (id.x < 4)
+        b_index[id.x] = 0;
+
+    const int size = BIN_PARTITIONS << RADIX_LOG;
+    for (int i = id.x; i < size; i += 1024 * 256)
+    {
+        b_passHist[i] = 0;
+        b_passTwo[i] = 0;
+        b_passThree[i] = 0;
+        b_passFour[i] = 0;
+    }
+}
+
+[numthreads(LANE_COUNT, G_HIST_WAVES, 1)]
+void GlobalHistogram(int3 gtid : SV_GroupThreadID, int3 gid : SV_GroupID)
+{
+    for (int i = GROUP_THREAD_ID; i < RADIX; i += G_HIST_THREADS)
+        g_globalHist[i] = 0;
+    GroupMemoryBarrierWithGroupSync();
+
+    //histogram
+    const int partitionEnd = G_HIST_PART_END;
+    for (int i = GROUP_THREAD_ID + G_HIST_PART_START; i < partitionEnd; i += G_HIST_THREADS)
+    {
+        const uint key = b_sort[i];
+        InterlockedAdd(g_globalHist[key & RADIX_MASK].x, 1);
+        InterlockedAdd(g_globalHist[key >> SEC_RADIX & RADIX_MASK].y, 1);
+        InterlockedAdd(g_globalHist[key >> THIRD_RADIX & RADIX_MASK].z, 1);
+        InterlockedAdd(g_globalHist[key >> FOURTH_RADIX].w, 1);
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    //prefixsum
+    for (int i = WAVE_INDEX << LANE_LOG; i < RADIX; i += G_HIST_THREADS)
+        g_globalHist[(LANE + 1 & LANE_MASK) + i] = WavePrefixSum(g_globalHist[LANE + i]) + g_globalHist[LANE + i];
+    GroupMemoryBarrierWithGroupSync();
+    
+    if (LANE < (RADIX >> LANE_LOG) && WAVE_INDEX == 0)
+        g_globalHist[LANE << LANE_LOG] += WavePrefixSum(g_globalHist[LANE << LANE_LOG]);
+    GroupMemoryBarrierWithGroupSync();
+    
+    int k = GROUP_THREAD_ID;
+    InterlockedAdd(b_globalHist[k], (LANE ? g_globalHist[k].x : 0) + (WAVE_INDEX ? WaveReadLaneAt(g_globalHist[k - LANE_COUNT].x, 0) : 0));
+    InterlockedAdd(b_globalHist[k + SEC_RADIX_START], (LANE ? g_globalHist[k].y : 0) + (WAVE_INDEX ? WaveReadLaneAt(g_globalHist[k - LANE_COUNT].y, 0) : 0));
+    InterlockedAdd(b_globalHist[k + THIRD_RADIX_START], (LANE ? g_globalHist[k].z : 0) + (WAVE_INDEX ? WaveReadLaneAt(g_globalHist[k - LANE_COUNT].z, 0) : 0));
+    InterlockedAdd(b_globalHist[k + FOURTH_RADIX_START], (LANE ? g_globalHist[k].w : 0) + (WAVE_INDEX ? WaveReadLaneAt(g_globalHist[k - LANE_COUNT].w, 0) : 0));
+    
+    for (k += G_HIST_THREADS; k < RADIX; k += G_HIST_THREADS)
+    {
+        InterlockedAdd(b_globalHist[k], (LANE ? g_globalHist[k].x : 0) + WaveReadLaneAt(g_globalHist[k - LANE_COUNT].x, 0));
+        InterlockedAdd(b_globalHist[k + SEC_RADIX_START], (LANE ? g_globalHist[k].y : 0) + WaveReadLaneAt(g_globalHist[k - LANE_COUNT].y, 0));
+        InterlockedAdd(b_globalHist[k + THIRD_RADIX_START], (LANE ? g_globalHist[k].z : 0) + WaveReadLaneAt(g_globalHist[k - LANE_COUNT].z, 0));
+        InterlockedAdd(b_globalHist[k + FOURTH_RADIX_START], (LANE ? g_globalHist[k].w : 0) + WaveReadLaneAt(g_globalHist[k - LANE_COUNT].w, 0));
+    }
+}
+
+[numthreads(LANE_COUNT, BIN_WAVES, 1)]
+void FirstBinningPass(int3 gtid : SV_GroupThreadID)
+{
+    //load the global histogram values into shared memory
+    if (GROUP_THREAD_ID < RADIX)
+        g_localHist[GROUP_THREAD_ID] = b_globalHist[GROUP_THREAD_ID];
+    
+    //atomically fetch and increment device memory index to assign partition tiles
+    //Take advantage of the barrier to also clear the shared memory
+    if (LANE == 0 && WAVE_INDEX == 0)
+        InterlockedAdd(b_index[0], 1, g_localHist[0]);
+    GroupMemoryBarrierWithGroupSync();
+    int partitionIndex = WaveReadLaneAt(g_localHist[0], 0);
+    for (int i = GROUP_THREAD_ID; i < BIN_HISTS_SIZE; i += BIN_THREADS)
+        g_waveHists[i] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    
+    //Load keys into registers
+    uint keys[BIN_KEYS_PER_THREAD];
+    {
+        [unroll]
+        for (int i = 0, t = LANE + BIN_SUB_PART_START + BIN_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+            keys[i] = b_sort[t];
+    }
+
+    //Warp Level Multisplit
+    uint offsets[BIN_KEYS_PER_THREAD];
+    {
+        const uint t = WAVE_INDEX << RADIX_LOG;
+            
+        [unroll]
+        for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+        {
+            offsets[i] = 0xFFFFFFFF;
+
+            [unroll]
+            for (int k = 0; k < RADIX_LOG; ++k)
+            {
+                const bool t2 = keys[i] >> k & 1;
+                offsets[i] &= (t2 ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t2);
+            }
+                
+            const uint bits = countbits(offsets[i] << LANE_MASK - LANE);
+            const int index = (keys[i] & RADIX_MASK) + t;
+            const uint prev = g_waveHists[index];
+            if (bits == 1)
+                g_waveHists[index] += countbits(offsets[i]);
+            offsets[i] = prev + bits - 1;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+        
+    //exclusive prefix sum across the histograms
+    if (GROUP_THREAD_ID < RADIX)
+    {
+        for (int k = GROUP_THREAD_ID + RADIX; k < BIN_HISTS_SIZE; k += RADIX)
+        {
+            g_waveHists[GROUP_THREAD_ID] += g_waveHists[k];
+            g_waveHists[k] = g_waveHists[GROUP_THREAD_ID] - g_waveHists[k];
+        }
+        g_reductionHist[GROUP_THREAD_ID] = g_waveHists[GROUP_THREAD_ID];
+            
+        if (partitionIndex == 0)
+            InterlockedAdd(b_passHist[GROUP_THREAD_ID * BIN_PARTITIONS + partitionIndex], FLAG_INCLUSIVE ^ (g_waveHists[GROUP_THREAD_ID] << 2));
+        else
+            InterlockedAdd(b_passHist[GROUP_THREAD_ID * BIN_PARTITIONS + partitionIndex], FLAG_AGGREGATE ^ (g_waveHists[GROUP_THREAD_ID] << 2));
+    }
+    GroupMemoryBarrierWithGroupSync(); // a barrier must be placed between here and the lookback to prevent accidentally broadcasting an incorrect aggregate
+
+    //exclusive prefix sum across the reductions
+    if (GROUP_THREAD_ID < RADIX)
+        g_reductionHist[(LANE + 1 & LANE_MASK) + (WAVE_INDEX << LANE_LOG)] = WavePrefixSum(g_reductionHist[GROUP_THREAD_ID]) + g_reductionHist[GROUP_THREAD_ID];
+    GroupMemoryBarrierWithGroupSync();
+        
+    if (LANE < (RADIX >> LANE_LOG) && WAVE_INDEX == 0)
+        g_reductionHist[LANE << LANE_LOG] = WavePrefixSum(g_reductionHist[LANE << LANE_LOG]);
+    GroupMemoryBarrierWithGroupSync();
+
+    if (GROUP_THREAD_ID < RADIX && LANE)
+        g_reductionHist[GROUP_THREAD_ID] += WaveReadLaneAt(g_reductionHist[GROUP_THREAD_ID - 1], 1);
+    GroupMemoryBarrierWithGroupSync();
+        
+    //Update offsets
+    if (WAVE_INDEX)
+    {
+        const uint t = WAVE_INDEX << RADIX_LOG;
+            
+        [unroll]
+        for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+        {
+            const uint t2 = keys[i] & RADIX_MASK;
+            offsets[i] += g_waveHists[t2 + t] + g_reductionHist[t2];
+        }
+    }
+    else
+    {
+        [unroll]
+        for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+            offsets[i] += g_reductionHist[keys[i] & RADIX_MASK];
+    }
+    GroupMemoryBarrierWithGroupSync();
+        
+    //Scatter keys into shared memory
+    //For some bizarre reason, this is significantly faster rolled
+    {
+        for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+            g_waveHists[offsets[i]] = keys[i];
+    }
+    GroupMemoryBarrierWithGroupSync();
+        
+    //Lookback
+    if (partitionIndex)
+    {
+        //Free up shared memory, because we are at max
+        const uint t = g_waveHists[WAVE_INDEX];
+            
+        for (int i = WAVE_INDEX; i < RADIX; i += BIN_WAVES)
+        {
+            uint aggregate = 0;
+            if (LANE == 0)
+                g_waveHists[WAVE_INDEX] = partitionIndex;
+                
+            for (int k = partitionIndex - LANE - 1; 0 <= k;)
+            {
+                uint flagPayload = b_passHist[i * BIN_PARTITIONS + k];
+                if (WaveActiveAllTrue((flagPayload & FLAG_MASK) > FLAG_NOT_READY))
+                {
+                    if ((flagPayload & FLAG_MASK) == FLAG_INCLUSIVE)
+                    {
+                        if (WaveIsFirstLane())
+                            g_waveHists[WAVE_INDEX] = k;
+                    }
+                        
+                    if (g_waveHists[WAVE_INDEX] < partitionIndex)
+                    {
+                        aggregate += WaveActiveSum(k >= g_waveHists[WAVE_INDEX] ? (flagPayload >> 2) : 0);
+                                
+                        if (LANE == 0)
+                        {
+                            InterlockedAdd(b_passHist[i * BIN_PARTITIONS + partitionIndex], 1 ^ (aggregate << 2));
+                            g_reductionHist[i] = aggregate + (i ? g_localHist[i] : 0) - g_reductionHist[i];
+                        }
+                        break;
+                    }
+                    else
+                    {
+                        aggregate += WaveActiveSum(flagPayload >> 2);
+                        k -= LANE_COUNT;
+                    }
+                }
+            }
+        }
+            
+        //place value back
+        if (LANE == 0)
+            g_waveHists[WAVE_INDEX] = t;
+    }
+    else
+    {
+        if (GROUP_THREAD_ID < RADIX)
+            g_reductionHist[GROUP_THREAD_ID] = (GROUP_THREAD_ID ? g_localHist[GROUP_THREAD_ID] : 0) - g_reductionHist[GROUP_THREAD_ID];
+    }
+    GroupMemoryBarrierWithGroupSync();
+        
+    //Scatter runs of keys into device memory
+    {
+        [unroll]
+        for (int i = 0, t = LANE + BIN_SUB_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+        {
+            keys[i] = g_reductionHist[g_waveHists[t] & RADIX_MASK] + t;
+            b_alt[keys[i]] = g_waveHists[t];
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    //Scatter payloads directly into shared memory
+    {
+        [unroll]
+        for (int i = 0, t = LANE + BIN_SUB_PART_START + BIN_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+            g_waveHists[offsets[i]] = b_sortPayload[t];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    //Scatter runs of payloads into device memory
+    {
+        [unroll]
+        for (int i = 0, t = LANE + BIN_SUB_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+            b_altPayload[keys[i]] = g_waveHists[t];
+    }
+    
+    //for input sizes which are not perfect multiples of the partition tile size
+    if (partitionIndex == BIN_PARTITIONS - 1)
+    {
+        if (GROUP_THREAD_ID < RADIX)
+            g_reductionHist[GROUP_THREAD_ID] = (b_passHist[GROUP_THREAD_ID * BIN_PARTITIONS + partitionIndex] >> 2) + (GROUP_THREAD_ID ? g_localHist[GROUP_THREAD_ID] : 0);
+        GroupMemoryBarrierWithGroupSync();
+        
+        partitionIndex++;
+        for (int i = GROUP_THREAD_ID + BIN_PART_START; i < e_size; i += BIN_THREADS)
+        {
+            const uint key = b_sort[i];
+            uint offset = 0xFFFFFFFF;
+            
+            [unroll]
+            for (int k = 0; k < RADIX_LOG; ++k)
+            {
+                const bool t = key >> k & 1;
+                offset &= (t ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t);
+            }
+            
+            [unroll]
+            for (int k = 0; k < BIN_WAVES; ++k)
+            {
+                if (WAVE_INDEX == k)
+                {
+                    const uint t = g_reductionHist[key & RADIX_MASK];
+                    if (countbits(offset << LANE_MASK - LANE) == 1)
+                        g_reductionHist[key & RADIX_MASK] += countbits(offset);
+                    offset = t + countbits((offset << LANE_MASK - LANE) << 1);
+                }
+                GroupMemoryBarrierWithGroupSync();
+            }
+
+            b_alt[offset] = key;
+            b_altPayload[offset] = b_sortPayload[i];
+        }
+    }
+    
+    //for the single pass timing test
+    if (LANE == 0 && WAVE_INDEX == 0)
+        b_timing[0] = 1;
+}
+
+[numthreads(LANE_COUNT, BIN_WAVES, 1)]
+void SecBinningPass(int3 gtid : SV_GroupThreadID)
+{
+    //load the global histogram values into shared memory
+    if (GROUP_THREAD_ID < RADIX)
+        g_localHist[GROUP_THREAD_ID] = b_globalHist[GROUP_THREAD_ID + SEC_RADIX_START];
+    
+    //atomically fetch and increment device memory index to assign partition tiles
+    //Take advantage of the barrier to also clear the shared memory
+    if (LANE == 0 && WAVE_INDEX == 0)
+        InterlockedAdd(b_index[1], 1, g_localHist[0]);
+    GroupMemoryBarrierWithGroupSync();
+    int partitionIndex = WaveReadLaneAt(g_localHist[0], 0);
+    for (int i = GROUP_THREAD_ID; i < BIN_HISTS_SIZE; i += BIN_THREADS)
+        g_waveHists[i] = 0;
+    GroupMemoryBarrierWithGroupSync();
+    
+    //Load keys into registers
+    uint keys[BIN_KEYS_PER_THREAD];
+    {
+        [unroll]
+        for (int i = 0, t = LANE + BIN_SUB_PART_START + BIN_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+            keys[i] = b_alt[t];
+    }
+
+    //Warp Level Multisplit
+    uint offsets[BIN_KEYS_PER_THREAD];
+    {
+        const uint t = WAVE_INDEX << RADIX_LOG;
+            
+        [unroll]
+        for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+        {
+            offsets[i] = 0xFFFFFFFF;
+
+            [unroll]
+            for (int k = SEC_RADIX; k < THIRD_RADIX; ++k)
+            {
+                const bool t2 = keys[i] >> k & 1;
+                offsets[i] &= (t2 ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t2);
+            }
+                
+            const uint bits = countbits(offsets[i] << LANE_MASK - LANE);
+            const int index = (keys[i] >> SEC_RADIX & RADIX_MASK) + t;
+            const uint prev = g_waveHists[index];
+            if (bits == 1)
+                g_waveHists[index] += countbits(offsets[i]);
+            offsets[i] = prev + bits - 1;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+        
+    //exclusive prefix sum across the histograms
+    if (GROUP_THREAD_ID < RADIX)
+    {
+        for (int k = GROUP_THREAD_ID + RADIX; k < BIN_HISTS_SIZE; k += RADIX)
+        {
+            g_waveHists[GROUP_THREAD_ID] += g_waveHists[k];
+            g_waveHists[k] = g_waveHists[GROUP_THREAD_ID] - g_waveHists[k];
+        }
+        g_reductionHist[GROUP_THREAD_ID] = g_waveHists[GROUP_THREAD_ID];
+            
+        if (partitionIndex == 0)
+            InterlockedAdd(b_passTwo[GROUP_THREAD_ID * BIN_PARTITIONS + partitionIndex], FLAG_INCLUSIVE ^ (g_waveHists[GROUP_THREAD_ID] << 2));
+        else
+            InterlockedAdd(b_passTwo[GROUP_THREAD_ID * BIN_PARTITIONS + partitionIndex], FLAG_AGGREGATE ^ (g_waveHists[GROUP_THREAD_ID] << 2));
+    }
+    GroupMemoryBarrierWithGroupSync(); // a barrier must be placed between here and the lookback to prevent accidentally broadcasting an incorrect aggregate
+
+    //exclusive prefix sum across the reductions
+    if (GROUP_THREAD_ID < RADIX)
+        g_reductionHist[(LANE + 1 & LANE_MASK) + (WAVE_INDEX << LANE_LOG)] = WavePrefixSum(g_reductionHist[GROUP_THREAD_ID]) + g_reductionHist[GROUP_THREAD_ID];
+    GroupMemoryBarrierWithGroupSync();
+        
+    if (LANE < (RADIX >> LANE_LOG) && WAVE_INDEX == 0)
+        g_reductionHist[LANE << LANE_LOG] = WavePrefixSum(g_reductionHist[LANE << LANE_LOG]);
+    GroupMemoryBarrierWithGroupSync();
+
+    if (GROUP_THREAD_ID < RADIX && LANE)
+        g_reductionHist[GROUP_THREAD_ID] += WaveReadLaneAt(g_reductionHist[GROUP_THREAD_ID - 1], 1);
+    GroupMemoryBarrierWithGroupSync();
+        
+    //Update offsets
+    if (WAVE_INDEX)
+    {
+        const uint t = WAVE_INDEX << RADIX_LOG;
+            
+        [unroll]
+        for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+        {
+            const uint t2 = keys[i] >> SEC_RADIX & RADIX_MASK;
+            offsets[i] += g_waveHists[t2 + t] + g_reductionHist[t2];
+        }
+    }
+    else
+    {
+        [unroll]
+        for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+            offsets[i] += g_reductionHist[keys[i] >> SEC_RADIX & RADIX_MASK];
+    }
+    GroupMemoryBarrierWithGroupSync();
+        
+    //Scatter keys into shared memory
+    //For some bizarre reason, this is significantly faster rolled
+    {
+        for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+            g_waveHists[offsets[i]] = keys[i];
+    }
+    GroupMemoryBarrierWithGroupSync();
+        
+    //Lookback
+    if (partitionIndex)
+    {
+        //Free up shared memory, because we are at max
+        const uint t = g_waveHists[WAVE_INDEX];
+            
+        for (int i = WAVE_INDEX; i < RADIX; i += BIN_WAVES)
+        {
+            uint aggregate = 0;
+            if (LANE == 0)
+                g_waveHists[WAVE_INDEX] = partitionIndex;
+                
+            for (int k = partitionIndex - LANE - 1; 0 <= k;)
+            {
+                uint flagPayload = b_passTwo[i * BIN_PARTITIONS + k];
+                if (WaveActiveAllTrue((flagPayload & FLAG_MASK) > FLAG_NOT_READY))
+                {
+                    if ((flagPayload & FLAG_MASK) == FLAG_INCLUSIVE)
+                    {
+                        if (WaveIsFirstLane())
+                            g_waveHists[WAVE_INDEX] = k;
+                    }
+                        
+                    if (g_waveHists[WAVE_INDEX] < partitionIndex)
+                    {
+                        aggregate += WaveActiveSum(k >= g_waveHists[WAVE_INDEX] ? (flagPayload >> 2) : 0);
+                                
+                        if (LANE == 0)
+                        {
+                            InterlockedAdd(b_passTwo[i * BIN_PARTITIONS + partitionIndex], 1 ^ (aggregate << 2));
+                            g_reductionHist[i] = aggregate + (i ? g_localHist[i] : 0) - g_reductionHist[i];
+                        }
+                        break;
+                    }
+                    else
+                    {
+                        aggregate += WaveActiveSum(flagPayload >> 2);
+                        k -= LANE_COUNT;
+                    }
+                }
+            }
+        }
+            
+        //place value back
+        if (LANE == 0)
+            g_waveHists[WAVE_INDEX] = t;
+    }
+    else
+    {
+        if (GROUP_THREAD_ID < RADIX)
+            g_reductionHist[GROUP_THREAD_ID] = (GROUP_THREAD_ID ? g_localHist[GROUP_THREAD_ID] : 0) - g_reductionHist[GROUP_THREAD_ID];
+    }
+    GroupMemoryBarrierWithGroupSync();
+        
+    //Scatter runs of keys into device memory
+    {
+        [unroll]
+        for (int i = 0, t = LANE + BIN_SUB_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+        {
+            keys[i] = g_reductionHist[g_waveHists[t] >> SEC_RADIX & RADIX_MASK] + t;
+            b_sort[keys[i]] = g_waveHists[t];
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    //Scatter payloads directly into shared memory
+    {
+        [unroll]
+        for (int i = 0, t = LANE + BIN_SUB_PART_START + BIN_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+            g_waveHists[offsets[i]] = b_altPayload[t];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    //Scatter runs of payloads into device memory
+    {
+        [unroll]
+        for (int i = 0, t = LANE + BIN_SUB_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+            b_sortPayload[keys[i]] = g_waveHists[t];
+    }
+    
+    //for input sizes which are not perfect multiples of the partition tile size
+    if (partitionIndex == BIN_PARTITIONS - 1)
+    {
+        if (GROUP_THREAD_ID < RADIX)
+            g_reductionHist[GROUP_THREAD_ID] = (b_passTwo[GROUP_THREAD_ID * BIN_PARTITIONS + partitionIndex] >> 2) + (GROUP_THREAD_ID ? g_localHist[GROUP_THREAD_ID] : 0);
+        GroupMemoryBarrierWithGroupSync();
+        
+        partitionIndex++;
+        for (int i = GROUP_THREAD_ID + BIN_PART_START; i < e_size; i += BIN_THREADS)
+        {
+            const uint key = b_alt[i];
+            uint offset = 0xFFFFFFFF;
+            
+            [unroll]
+            for (int k = SEC_RADIX; k < THIRD_RADIX; ++k)
+            {
+                const bool t = key >> k & 1;
+                offset &= (t ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t);
+            }
+            
+            [unroll]
+            for (int k = 0; k < BIN_WAVES; ++k)
+            {
+                if (WAVE_INDEX == k)
+                {
+                    const uint t = g_reductionHist[key >> SEC_RADIX & RADIX_MASK];
+                    if (countbits(offset << LANE_MASK - LANE) == 1)
+                        g_reductionHist[key >> SEC_RADIX & RADIX_MASK] += countbits(offset);
+                    offset = t + countbits((offset << LANE_MASK - LANE) << 1);
+                }
+                GroupMemoryBarrierWithGroupSync();
+            }
+
+            b_sort[offset] = key;
+            b_sortPayload[offset] = b_altPayload[i];
+        }
+    }
+}
+
+[numthreads(LANE_COUNT, BIN_WAVES, 1)]
+void ThirdBinningPass(int3 gtid : SV_GroupThreadID)
+{
+    //load the global histogram values into shared memory
+    if (GROUP_THREAD_ID < RADIX)
+        g_localHist[GROUP_THREAD_ID] = b_globalHist[GROUP_THREAD_ID + THIRD_RADIX_START];
+    
+    //atomically fetch and increment device memory index to assign partition tiles
+    //Take advantage of the barrier to also clear the shared memory
+    if (LANE == 0 && WAVE_INDEX == 0)
+        InterlockedAdd(b_index[2], 1, g_localHist[0]);
+    GroupMemoryBarrierWithGroupSync();
+    int partitionIndex = WaveReadLaneAt(g_localHist[0], 0);
+    for (int i = GROUP_THREAD_ID; i < BIN_HISTS_SIZE; i += BIN_THREADS)
+        g_waveHists[i] = 0;
+    GroupMemoryBarrierWithGroupSync();
+        
+    //Load keys into registers
+    uint keys[BIN_KEYS_PER_THREAD];
+    {
+        [unroll]
+        for (int i = 0, t = LANE + BIN_SUB_PART_START + BIN_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+            keys[i] = b_sort[t];
+    }
+
+    //Warp Level Multisplit
+    uint offsets[BIN_KEYS_PER_THREAD];
+    {
+        const uint t = WAVE_INDEX << RADIX_LOG;
+            
+        [unroll]
+        for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+        {
+            offsets[i] = 0xFFFFFFFF;
+
+            [unroll]
+            for (int k = THIRD_RADIX; k < FOURTH_RADIX; ++k)
+            {
+                const bool t2 = keys[i] >> k & 1;
+                offsets[i] &= (t2 ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t2);
+            }
+                
+            const uint bits = countbits(offsets[i] << LANE_MASK - LANE);
+            const int index = (keys[i] >> THIRD_RADIX & RADIX_MASK) + t;
+            const uint prev = g_waveHists[index];
+            if (bits == 1)
+                g_waveHists[index] += countbits(offsets[i]);
+            offsets[i] = prev + bits - 1;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+        
+    //exclusive prefix sum across the histograms
+    if (GROUP_THREAD_ID < RADIX)
+    {
+        for (int k = GROUP_THREAD_ID + RADIX; k < BIN_HISTS_SIZE; k += RADIX)
+        {
+            g_waveHists[GROUP_THREAD_ID] += g_waveHists[k];
+            g_waveHists[k] = g_waveHists[GROUP_THREAD_ID] - g_waveHists[k];
+        }
+        g_reductionHist[GROUP_THREAD_ID] = g_waveHists[GROUP_THREAD_ID];
+            
+        if (partitionIndex == 0)
+            InterlockedAdd(b_passThree[GROUP_THREAD_ID * BIN_PARTITIONS + partitionIndex], FLAG_INCLUSIVE ^ (g_waveHists[GROUP_THREAD_ID] << 2));
+        else
+            InterlockedAdd(b_passThree[GROUP_THREAD_ID * BIN_PARTITIONS + partitionIndex], FLAG_AGGREGATE ^ (g_waveHists[GROUP_THREAD_ID] << 2));
+    }
+    GroupMemoryBarrierWithGroupSync(); // a barrier must be placed between here and the lookback to prevent accidentally broadcasting an incorrect aggregate
+
+    //exclusive prefix sum across the reductions
+    if (GROUP_THREAD_ID < RADIX)
+        g_reductionHist[(LANE + 1 & LANE_MASK) + (WAVE_INDEX << LANE_LOG)] = WavePrefixSum(g_reductionHist[GROUP_THREAD_ID]) + g_reductionHist[GROUP_THREAD_ID];
+    GroupMemoryBarrierWithGroupSync();
+        
+    if (LANE < (RADIX >> LANE_LOG) && WAVE_INDEX == 0)
+        g_reductionHist[LANE << LANE_LOG] = WavePrefixSum(g_reductionHist[LANE << LANE_LOG]);
+    GroupMemoryBarrierWithGroupSync();
+
+    if (GROUP_THREAD_ID < RADIX && LANE)
+        g_reductionHist[GROUP_THREAD_ID] += WaveReadLaneAt(g_reductionHist[GROUP_THREAD_ID - 1], 1);
+    GroupMemoryBarrierWithGroupSync();
+        
+    //Update offsets
+    if (WAVE_INDEX)
+    {
+        const uint t = WAVE_INDEX << RADIX_LOG;
+            
+        [unroll]
+        for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+        {
+            const uint t2 = keys[i] >> THIRD_RADIX & RADIX_MASK;
+            offsets[i] += g_waveHists[t2 + t] + g_reductionHist[t2];
+        }
+    }
+    else
+    {
+        [unroll]
+        for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+            offsets[i] += g_reductionHist[keys[i] >> THIRD_RADIX & RADIX_MASK];
+    }
+    GroupMemoryBarrierWithGroupSync();
+        
+    //Scatter keys into shared memory
+    //For some bizarre reason, this is significantly faster rolled
+    {
+        for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+            g_waveHists[offsets[i]] = keys[i];
+    }
+    GroupMemoryBarrierWithGroupSync();
+        
+    //Lookback
+    if (partitionIndex)
+    {
+        //Free up shared memory, because we are at max
+        const uint t = g_waveHists[WAVE_INDEX];
+            
+        for (int i = WAVE_INDEX; i < RADIX; i += BIN_WAVES)
+        {
+            uint aggregate = 0;
+            if (LANE == 0)
+                g_waveHists[WAVE_INDEX] = partitionIndex;
+                
+            for (int k = partitionIndex - LANE - 1; 0 <= k;)
+            {
+                uint flagPayload = b_passThree[i * BIN_PARTITIONS + k];
+                if (WaveActiveAllTrue((flagPayload & FLAG_MASK) > FLAG_NOT_READY))
+                {
+                    if ((flagPayload & FLAG_MASK) == FLAG_INCLUSIVE)
+                    {
+                        if (WaveIsFirstLane())
+                            g_waveHists[WAVE_INDEX] = k;
+                    }
+                        
+                    if (g_waveHists[WAVE_INDEX] < partitionIndex)
+                    {
+                        aggregate += WaveActiveSum(k >= g_waveHists[WAVE_INDEX] ? (flagPayload >> 2) : 0);
+                                
+                        if (LANE == 0)
+                        {
+                            InterlockedAdd(b_passThree[i * BIN_PARTITIONS + partitionIndex], 1 ^ (aggregate << 2));
+                            g_reductionHist[i] = aggregate + (i ? g_localHist[i] : 0) - g_reductionHist[i];
+                        }
+                        break;
+                    }
+                    else
+                    {
+                        aggregate += WaveActiveSum(flagPayload >> 2);
+                        k -= LANE_COUNT;
+                    }
+                }
+            }
+        }
+            
+        //place value back
+        if (LANE == 0)
+            g_waveHists[WAVE_INDEX] = t;
+    }
+    else
+    {
+        if (GROUP_THREAD_ID < RADIX)
+            g_reductionHist[GROUP_THREAD_ID] = (GROUP_THREAD_ID ? g_localHist[GROUP_THREAD_ID] : 0) - g_reductionHist[GROUP_THREAD_ID];
+    }
+    GroupMemoryBarrierWithGroupSync();
+        
+    //Scatter runs of keys into device memory
+    {
+        [unroll]
+        for (int i = 0, t = LANE + BIN_SUB_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+        {
+            keys[i] = g_reductionHist[g_waveHists[t] >> THIRD_RADIX & RADIX_MASK] + t;
+            b_alt[keys[i]] = g_waveHists[t];
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    //Scatter payloads directly into shared memory
+    {
+        [unroll]
+        for (int i = 0, t = LANE + BIN_SUB_PART_START + BIN_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+            g_waveHists[offsets[i]] = b_sortPayload[t];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    //Scatter runs of payloads into device memory
+    {
+        [unroll]
+        for (int i = 0, t = LANE + BIN_SUB_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+            b_altPayload[keys[i]] = g_waveHists[t];
+    }
+    
+    //for input sizes which are not perfect multiples of the partition tile size
+    if (partitionIndex == BIN_PARTITIONS - 1)
+    {
+        if (GROUP_THREAD_ID < RADIX)
+            g_reductionHist[GROUP_THREAD_ID] = (b_passThree[GROUP_THREAD_ID * BIN_PARTITIONS + partitionIndex] >> 2) + (GROUP_THREAD_ID ? g_localHist[GROUP_THREAD_ID] : 0);
+        GroupMemoryBarrierWithGroupSync();
+        
+        partitionIndex++;
+        for (int i = GROUP_THREAD_ID + BIN_PART_START; i < e_size; i += BIN_THREADS)
+        {
+            const uint key = b_sort[i];
+            uint offset = 0xFFFFFFFF;
+            
+            [unroll]
+            for (int k = THIRD_RADIX; k < FOURTH_RADIX; ++k)
+            {
+                const bool t = key >> k & 1;
+                offset &= (t ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t);
+            }
+            
+            [unroll]
+            for (int k = 0; k < BIN_WAVES; ++k)
+            {
+                if (WAVE_INDEX == k)
+                {
+                    const uint t = g_reductionHist[key >> THIRD_RADIX & RADIX_MASK];
+                    if (countbits(offset << LANE_MASK - LANE) == 1)
+                        g_reductionHist[key >> THIRD_RADIX & RADIX_MASK] += countbits(offset);
+                    offset = t + countbits((offset << LANE_MASK - LANE) << 1);
+                }
+                GroupMemoryBarrierWithGroupSync();
+            }
+
+            b_alt[offset] = key;
+            b_altPayload[offset] = b_sortPayload[i];
+        }
+    }
+}
+
+[numthreads(LANE_COUNT, BIN_WAVES, 1)]
+void FourthBinningPass(int3 gtid : SV_GroupThreadID, int3 gid : SV_GroupID)
+{
+    //load the global histogram values into shared memory
+    if (GROUP_THREAD_ID < RADIX)
+        g_localHist[GROUP_THREAD_ID] = b_globalHist[GROUP_THREAD_ID + FOURTH_RADIX_START];
+    
+    //atomically fetch and increment device memory index to assign partition tiles
+    //Take advantage of the barrier to also clear the shared memory
+    if (LANE == 0 && WAVE_INDEX == 0)
+        InterlockedAdd(b_index[3], 1, g_localHist[0]);
+    GroupMemoryBarrierWithGroupSync();
+    int partitionIndex = WaveReadLaneAt(g_localHist[0], 0);
+    for (int i = GROUP_THREAD_ID; i < BIN_HISTS_SIZE; i += BIN_THREADS)
+        g_waveHists[i] = 0;
+    GroupMemoryBarrierWithGroupSync();
+        
+    //Load keys into registers
+    uint keys[BIN_KEYS_PER_THREAD];
+    {
+        [unroll]
+        for (int i = 0, t = LANE + BIN_SUB_PART_START + BIN_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+            keys[i] = b_alt[t];
+    }
+
+    //Warp Level Multisplit
+    uint offsets[BIN_KEYS_PER_THREAD];
+    {
+        const uint t = WAVE_INDEX << RADIX_LOG;
+            
+        [unroll]
+        for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+        {
+            offsets[i] = 0xFFFFFFFF;
+
+            [unroll]
+            for (int k = FOURTH_RADIX; k < 32; ++k)
+            {
+                const bool t2 = keys[i] >> k & 1;
+                offsets[i] &= (t2 ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t2);
+            }
+                
+            const uint bits = countbits(offsets[i] << LANE_MASK - LANE);
+            const int index = (keys[i] >> FOURTH_RADIX) + t;
+            const uint prev = g_waveHists[index];
+            if (bits == 1)
+                g_waveHists[index] += countbits(offsets[i]);
+            offsets[i] = prev + bits - 1;
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+        
+    //exclusive prefix sum across the histograms
+    if (GROUP_THREAD_ID < RADIX)
+    {
+        for (int k = GROUP_THREAD_ID + RADIX; k < BIN_HISTS_SIZE; k += RADIX)
+        {
+            g_waveHists[GROUP_THREAD_ID] += g_waveHists[k];
+            g_waveHists[k] = g_waveHists[GROUP_THREAD_ID] - g_waveHists[k];
+        }
+        g_reductionHist[GROUP_THREAD_ID] = g_waveHists[GROUP_THREAD_ID];
+            
+        if (partitionIndex == 0)
+            InterlockedAdd(b_passFour[GROUP_THREAD_ID * BIN_PARTITIONS + partitionIndex], FLAG_INCLUSIVE ^ (g_waveHists[GROUP_THREAD_ID] << 2));
+        else
+            InterlockedAdd(b_passFour[GROUP_THREAD_ID * BIN_PARTITIONS + partitionIndex], FLAG_AGGREGATE ^ (g_waveHists[GROUP_THREAD_ID] << 2));
+    }
+    GroupMemoryBarrierWithGroupSync(); // a barrier must be placed between here and the lookback to prevent accidentally broadcasting an incorrect aggregate
+
+    //exclusive prefix sum across the reductions
+    if (GROUP_THREAD_ID < RADIX)
+        g_reductionHist[(LANE + 1 & LANE_MASK) + (WAVE_INDEX << LANE_LOG)] = WavePrefixSum(g_reductionHist[GROUP_THREAD_ID]) + g_reductionHist[GROUP_THREAD_ID];
+    GroupMemoryBarrierWithGroupSync();
+        
+    if (LANE < (RADIX >> LANE_LOG) && WAVE_INDEX == 0)
+        g_reductionHist[LANE << LANE_LOG] = WavePrefixSum(g_reductionHist[LANE << LANE_LOG]);
+    GroupMemoryBarrierWithGroupSync();
+
+    if (GROUP_THREAD_ID < RADIX && LANE)
+        g_reductionHist[GROUP_THREAD_ID] += WaveReadLaneAt(g_reductionHist[GROUP_THREAD_ID - 1], 1);
+    GroupMemoryBarrierWithGroupSync();
+        
+    //Update offsets
+    if (WAVE_INDEX)
+    {
+        const uint t = WAVE_INDEX << RADIX_LOG;
+            
+        [unroll]
+        for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+        {
+            const uint t2 = keys[i] >> FOURTH_RADIX;
+            offsets[i] += g_waveHists[t2 + t] + g_reductionHist[t2];
+        }
+    }
+    else
+    {
+        [unroll]
+        for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+            offsets[i] += g_reductionHist[keys[i] >> FOURTH_RADIX];
+    }
+    GroupMemoryBarrierWithGroupSync();
+        
+    //Scatter keys into shared memory
+    //For some bizarre reason, this is significantly faster rolled
+    {
+        for (int i = 0; i < BIN_KEYS_PER_THREAD; ++i)
+            g_waveHists[offsets[i]] = keys[i];
+    }
+    GroupMemoryBarrierWithGroupSync();
+        
+    //Lookback
+    if (partitionIndex)
+    {
+        //Free up shared memory, because we are at max
+        const uint t = g_waveHists[WAVE_INDEX];
+            
+        for (int i = WAVE_INDEX; i < RADIX; i += BIN_WAVES)
+        {
+            uint aggregate = 0;
+            if (LANE == 0)
+                g_waveHists[WAVE_INDEX] = partitionIndex;
+                
+            for (int k = partitionIndex - LANE - 1; 0 <= k;)
+            {
+                uint flagPayload = b_passFour[i * BIN_PARTITIONS + k];
+                if (WaveActiveAllTrue((flagPayload & FLAG_MASK) > FLAG_NOT_READY))
+                {
+                    if ((flagPayload & FLAG_MASK) == FLAG_INCLUSIVE)
+                    {
+                        if (WaveIsFirstLane())
+                            g_waveHists[WAVE_INDEX] = k;
+                    }
+                        
+                    if (g_waveHists[WAVE_INDEX] < partitionIndex)
+                    {
+                        aggregate += WaveActiveSum(k >= g_waveHists[WAVE_INDEX] ? (flagPayload >> 2) : 0);
+                                
+                        if (LANE == 0)
+                        {
+                            InterlockedAdd(b_passFour[i * BIN_PARTITIONS + partitionIndex], 1 ^ (aggregate << 2));
+                            g_reductionHist[i] = aggregate + (i ? g_localHist[i] : 0) - g_reductionHist[i];
+                        }
+                        break;
+                    }
+                    else
+                    {
+                        aggregate += WaveActiveSum(flagPayload >> 2);
+                        k -= LANE_COUNT;
+                    }
+                }
+            }
+        }
+            
+        //place value back
+        if (LANE == 0)
+            g_waveHists[WAVE_INDEX] = t;
+    }
+    else
+    {
+        if (GROUP_THREAD_ID < RADIX)
+            g_reductionHist[GROUP_THREAD_ID] = (GROUP_THREAD_ID ? g_localHist[GROUP_THREAD_ID] : 0) - g_reductionHist[GROUP_THREAD_ID];
+    }
+    GroupMemoryBarrierWithGroupSync();
+        
+    //Scatter runs of keys into device memory
+    {
+        [unroll]
+        for (int i = 0, t = LANE + BIN_SUB_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+        {
+            keys[i] = g_reductionHist[g_waveHists[t] >> FOURTH_RADIX] + t;
+            b_sort[keys[i]] = g_waveHists[t];
+        }
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    //Scatter payloads directly into shared memory
+    {
+        [unroll]
+        for (int i = 0, t = LANE + BIN_SUB_PART_START + BIN_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+            g_waveHists[offsets[i]] = b_altPayload[t];
+    }
+    GroupMemoryBarrierWithGroupSync();
+    
+    //Scatter runs of payloads into device memory
+    {
+        [unroll]
+        for (int i = 0, t = LANE + BIN_SUB_PART_START; i < BIN_KEYS_PER_THREAD; ++i, t += LANE_COUNT)
+            b_sortPayload[keys[i]] = g_waveHists[t];
+    }
+    
+    //for input sizes which are not perfect multiples of the partition tile size
+    if (partitionIndex == BIN_PARTITIONS - 1)
+    {
+        if (GROUP_THREAD_ID < RADIX)
+            g_reductionHist[GROUP_THREAD_ID] = (b_passFour[GROUP_THREAD_ID * BIN_PARTITIONS + partitionIndex] >> 2) + (GROUP_THREAD_ID ? g_localHist[GROUP_THREAD_ID] : 0);
+        GroupMemoryBarrierWithGroupSync();
+        
+        partitionIndex++;
+        for (int i = GROUP_THREAD_ID + BIN_PART_START; i < e_size; i += BIN_THREADS)
+        {
+            const uint key = b_alt[i];
+            uint offset = 0xFFFFFFFF;
+            
+            [unroll]
+            for (int k = FOURTH_RADIX; k < 32; ++k)
+            {
+                const bool t = key >> k & 1;
+                offset &= (t ? 0 : 0xFFFFFFFF) ^ WaveActiveBallot(t);
+            }
+            
+            [unroll]
+            for (int k = 0; k < BIN_WAVES; ++k)
+            {
+                if (WAVE_INDEX == k)
+                {
+                    const uint t = g_reductionHist[key >> FOURTH_RADIX];
+                    if (countbits(offset << LANE_MASK - LANE) == 1)
+                        g_reductionHist[key >> FOURTH_RADIX] += countbits(offset);
+                    offset = t + countbits((offset << LANE_MASK - LANE) << 1);
+                }
+                GroupMemoryBarrierWithGroupSync();
+            }
+
+            b_sort[offset] = key;
+            b_sortPayload[offset] = b_altPayload[i];
+        }
+    }
+}
