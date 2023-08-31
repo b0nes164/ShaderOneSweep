@@ -66,7 +66,6 @@ public class OneSweep : MonoBehaviour
     private const int k_scatterThree = 5;
     private const int k_scatterFour = 6;
 
-    private int binningThreadBlocks;
     private int globalHistThreadBlocks;
     private int radixPasses;
     private int radix;
@@ -82,7 +81,6 @@ public class OneSweep : MonoBehaviour
     {
         radixPasses = 4;
         radix = 256;
-        binningThreadBlocks = 512;
         globalHistThreadBlocks = 2048;
         partitionSize = 7680;
         computeShaderString = "OneSweep";
@@ -156,7 +154,7 @@ public class OneSweep : MonoBehaviour
     {
         try
         {
-            compute.FindKernel("InitOneSweep");
+            compute.FindKernel("Init" + computeShaderString);
         }
         catch
         {
@@ -267,6 +265,14 @@ public class OneSweep : MonoBehaviour
         compute.SetBuffer(k_scatterFour, "b_timing", timingBuffer);
     }
 
+    private void DispatchKernels()
+    {
+        compute.Dispatch(k_globalHist, globalHistThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterOne, size / partitionSize, 1, 1);
+        compute.Dispatch(k_scatterTwo, size / partitionSize, 1, 1);
+        compute.Dispatch(k_scatterThree, size / partitionSize, 1, 1);
+        compute.Dispatch(k_scatterFour, size / partitionSize, 1, 1);
+    }
 
     private void ResetBuffers()
     {
@@ -282,45 +288,27 @@ public class OneSweep : MonoBehaviour
     private IEnumerator ValidateSort(int _size)
     {
         breaker = false;
+
         validationArray = new uint[_size];
-
-        compute.Dispatch(k_globalHist, globalHistThreadBlocks, 1, 1);
-
-        compute.Dispatch(k_scatterOne, binningThreadBlocks, 1, 1);
-
-        compute.Dispatch(k_scatterTwo, binningThreadBlocks, 1, 1);
-
-        compute.Dispatch(k_scatterThree, binningThreadBlocks, 1, 1);
-
-        compute.Dispatch(k_scatterFour, binningThreadBlocks, 1, 1);
-
+        DispatchKernels();
         sortBuffer.GetData(validationArray);
         yield return new WaitForSeconds(.25f);  //To prevent unity from crashing
-
         ValSort(_size);
+
         breaker = true;
     }
 
     private IEnumerator ValidateSortRandom(int _size)
     {
         breaker = false;
+
         validationArray = new uint[_size];
         ResetBuffersRandom();
-
-        compute.Dispatch(k_globalHist, globalHistThreadBlocks, 1, 1);
-
-        compute.Dispatch(k_scatterOne, binningThreadBlocks, 1, 1);
-
-        compute.Dispatch(k_scatterTwo, binningThreadBlocks, 1, 1);
-
-        compute.Dispatch(k_scatterThree, binningThreadBlocks, 1, 1);
-
-        compute.Dispatch(k_scatterFour, binningThreadBlocks, 1, 1);
-
+        DispatchKernels();
         sortBuffer.GetData(validationArray);
         yield return new WaitForSeconds(.25f);  //To prevent unity from crashing
-
         ValRand(_size);
+
         breaker = true;
     }
 
@@ -333,7 +321,7 @@ public class OneSweep : MonoBehaviour
         yield return new WaitUntil(() => request.done);
 
         float time = Time.realtimeSinceStartup;
-        compute.Dispatch(k_scatterOne, binningThreadBlocks, 1, 1);
+        compute.Dispatch(k_scatterOne, _size / partitionSize, 1, 1);
         request = AsyncGPUReadback.Request(timingBuffer);
         yield return new WaitUntil(() => request.done);
         time = Time.realtimeSinceStartup - time;
@@ -352,16 +340,7 @@ public class OneSweep : MonoBehaviour
         yield return new WaitUntil(() => request.done);
 
         float time = Time.realtimeSinceStartup;
-        compute.Dispatch(k_globalHist, globalHistThreadBlocks, 1, 1);
-
-        compute.Dispatch(k_scatterOne, binningThreadBlocks, 1, 1);
-
-        compute.Dispatch(k_scatterTwo, binningThreadBlocks, 1, 1);
-
-        compute.Dispatch(k_scatterThree, binningThreadBlocks, 1, 1);
-
-        compute.Dispatch(k_scatterFour, binningThreadBlocks, 1, 1);
-
+        DispatchKernels();
         request = AsyncGPUReadback.Request(timingBuffer);
         yield return new WaitUntil(() => request.done);
         time = Time.realtimeSinceStartup - time;
@@ -381,16 +360,7 @@ public class OneSweep : MonoBehaviour
         yield return new WaitUntil(() => request.done);
 
         float time = Time.realtimeSinceStartup;
-        compute.Dispatch(k_globalHist, globalHistThreadBlocks, 1, 1);
-
-        compute.Dispatch(k_scatterOne, binningThreadBlocks, 1, 1);
-
-        compute.Dispatch(k_scatterTwo, binningThreadBlocks, 1, 1);
-
-        compute.Dispatch(k_scatterThree, binningThreadBlocks, 1, 1);
-
-        compute.Dispatch(k_scatterFour, binningThreadBlocks, 1, 1);
-
+        DispatchKernels();
         request = AsyncGPUReadback.Request(timingBuffer);
         yield return new WaitUntil(() => request.done);
         time = Time.realtimeSinceStartup - time;
@@ -418,17 +388,7 @@ public class OneSweep : MonoBehaviour
             yield return new WaitUntil(() => request.done);
 
             time = Time.realtimeSinceStartup;
-
-            compute.Dispatch(k_globalHist, globalHistThreadBlocks, 1, 1);
-
-            compute.Dispatch(k_scatterOne, binningThreadBlocks, 1, 1);
-
-            compute.Dispatch(k_scatterTwo, binningThreadBlocks, 1, 1);
-
-            compute.Dispatch(k_scatterThree, binningThreadBlocks, 1, 1);
-
-            compute.Dispatch(k_scatterFour, binningThreadBlocks, 1, 1);
-
+            DispatchKernels();
             request = AsyncGPUReadback.Request(timingBuffer);
             yield return new WaitUntil(() => request.done);
             time = Time.realtimeSinceStartup - time;
