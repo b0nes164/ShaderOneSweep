@@ -1,10 +1,9 @@
 # ShaderOneSweep
-![Sorting Speeds Comparison](https://github.com/b0nes164/ShaderOneSweep/assets/68340554/33387b57-387c-4aab-aac0-fc674b67c0e6)
-
+![Sorting Speeds Comparison(1)](https://github.com/b0nes164/ShaderOneSweep/assets/68340554/7bc88d9d-fce4-48b9-9854-de47ea83b8aa)
 
 This project is an HLSL compute shader implementation of the current state of the art GPU sorting algorithm, Adinets and Merrill's [OneSweep](https://research.nvidia.com/publication/2022-06_onesweep-faster-least-significant-digit-radix-sort-gpus), an LSD radix sort that uses Merrill and Garland's [Chained Scan with Decoupled Lookback](https://research.nvidia.com/publication/2016-03_single-pass-parallel-prefix-scan-decoupled-look-back) to reduce the overall global data movement during a digit-binning pass from $3n$ to $2n$. 
 
-Given an input size of $2^{28}$ 32-bit random keys and a uniform random distribution, our implementation achieves a harmonic mean performance of 5.84 G keys/sec, an effective memory bandwidth utilization of ~42.4%. Although this is lower than the ~55% achieved in the _OneSweep_ paper, the difference is likely due to HLSL's lack of the `reinterpret_cast` functionality that would allow us to easily perform vectorized loading and then transposition to a striped format of the keys. The previous fastest compute shader sorting implementation I could find was by far Dondragmer's [PrefixSort](https://gist.github.com/dondragmer/c75a1a50f1cdd00c104d3483375bdb2f), which is also an 8-bit LSD radix sort and also incorporates Ashkiani et. al.'s [GpuMultiSplit](https://arxiv.org/abs/1701.01189), but uses the older $3n$ data movement Reduce-then-Scan pattern to perform the inter-threadblock prefix sum. To read more about how I performed the testing, see the Testing Methodology section. 
+Given an input size of $2^{28}$ 32-bit random keys and a uniform random distribution, our implementation achieves a harmonic mean performance of 5.84 G keys/sec, an effective memory bandwidth utilization of ~44.4%. Although this is lower than the ~55% achieved in the _OneSweep_ paper, the difference is likely due to HLSL's lack of the `reinterpret_cast` functionality that would allow us to easily perform vectorized loading and then transposition to a striped format of the keys. The previous fastest compute shader sorting implementation I could find was by far Dondragmer's [PrefixSort](https://gist.github.com/dondragmer/c75a1a50f1cdd00c104d3483375bdb2f), which is also an 8-bit LSD radix sort and also incorporates Ashkiani et. al.'s [GpuMultiSplit](https://arxiv.org/abs/1701.01189), but uses the older $3n$ data movement Reduce-then-Scan pattern to perform the inter-threadblock prefix sum. To read more about how I performed the testing, see the Testing Methodology section. 
 
 # To Use This Project
 
@@ -236,7 +235,7 @@ void Init(int3 id : SV_DispatchThreadID)
 
 </details>
 
-# Strongly Suggested Reading Bibliography
+# Strongly Suggested Reading and Bibliography
 Andy Adinets and Duane Merrill. Onesweep: A Faster Least Significant Digit Radix Sort for GPUs. 2022. arXiv: 2206.01784 [cs.DC]
 
 Duane Merrill and Michael Garland. “Single-pass Parallel Prefix Scan with De-coupled Lookback”. In: 2016. url: https://research.nvidia.com/publication/2016-03_single-pass-parallel-prefix-scan-decoupled-look-back
