@@ -56,14 +56,14 @@ public class BlockRadixSortKeyValue : MonoBehaviour
     private const int minSize = 15;
     private const int maxSize = 27;
 
-    private const int k_init = 0;
-    private const int k_initRandom = 1;
-    private const int k_initStability = 2;
-    private const int k_globalHist = 3;
-    private const int k_scatterOne = 4;
-    private const int k_scatterTwo = 5;
-    private const int k_scatterThree = 6;
-    private const int k_scatterFour = 7;
+    private const int k_initDescending = 1;
+    private const int k_initRandom = 2;
+    private const int k_initStability = 3;
+    private const int k_globalHist = 4;
+    private const int k_scatterOne = 5;
+    private const int k_scatterTwo = 6;
+    private const int k_scatterThree = 7;
+    private const int k_scatterFour = 8;
 
     private int radixPasses;
     private int radix;
@@ -117,7 +117,7 @@ public class BlockRadixSortKeyValue : MonoBehaviour
 
     private void Dispatcher()
     {
-        ResetBuffers();
+        ResetBuffersDescending();
 
         switch (testType)
         {
@@ -184,8 +184,8 @@ public class BlockRadixSortKeyValue : MonoBehaviour
         altBuffer = new ComputeBuffer(_size, sizeof(uint));
         altPayloadBuffer = new ComputeBuffer(_size, sizeof(uint));
 
-        compute.SetBuffer(k_init, "b_sort", sortBuffer);
-        compute.SetBuffer(k_init, "b_sortPayload", sortPayloadBuffer);
+        compute.SetBuffer(k_initDescending, "b_sort", sortBuffer);
+        compute.SetBuffer(k_initDescending, "b_sortPayload", sortPayloadBuffer);
 
         compute.SetBuffer(k_initRandom, "b_sort", sortBuffer);
         compute.SetBuffer(k_initRandom, "b_sortPayload", sortPayloadBuffer);
@@ -220,7 +220,7 @@ public class BlockRadixSortKeyValue : MonoBehaviour
     {
         globalHistBuffer = new ComputeBuffer(radix * radixPasses, sizeof(uint));
 
-        compute.SetBuffer(k_init, "b_globalHist", globalHistBuffer);
+        compute.SetBuffer(k_initDescending, "b_globalHist", globalHistBuffer);
         compute.SetBuffer(k_initRandom, "b_globalHist", globalHistBuffer);
         compute.SetBuffer(k_initStability, "b_globalHist", globalHistBuffer);
         compute.SetBuffer(k_globalHist, "b_globalHist", globalHistBuffer);
@@ -246,9 +246,9 @@ public class BlockRadixSortKeyValue : MonoBehaviour
         compute.Dispatch(k_scatterFour, 1, 1, 1);
     }
 
-    private void ResetBuffers()
+    private void ResetBuffersDescending()
     {
-        compute.Dispatch(k_init, 256, 1, 1);
+        compute.Dispatch(k_initDescending, 256, 1, 1);
     }
 
     private void ResetBuffersRandom()
