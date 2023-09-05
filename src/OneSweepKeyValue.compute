@@ -36,6 +36,7 @@
  ******************************************************************************/
 #pragma use_dxc
 #pragma kernel InitOneSweepKeyValue
+#pragma kernel InitDescending
 #pragma kernel InitRandom
 #pragma kernel InitStability
 #pragma kernel GlobalHistogram 
@@ -122,6 +123,25 @@ groupshared uint g_reductionHist[RADIX];                        //Shared memory 
 
 [numthreads(1024, 1, 1)]
 void InitOneSweepKeyValue(int3 id : SV_DispatchThreadID)
+{    
+    if (id.x < 1024)
+        b_globalHist[id.x] = 0;
+        
+    if (id.x < 4)
+        b_index[id.x] = 0;
+
+    const int size = BIN_PARTITIONS << RADIX_LOG;
+    for (int i = id.x; i < size; i += 1024 * 256)
+    {
+        b_passHist[i] = 0;
+        b_passTwo[i] = 0;
+        b_passThree[i] = 0;
+        b_passFour[i] = 0;
+    }
+}
+
+[numthreads(1024, 1, 1)]
+void InitDescending(int3 id : SV_DispatchThreadID)
 {
     for (int i = id.x; i < e_size; i += 1024 * 256)
     {

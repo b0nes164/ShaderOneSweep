@@ -10,6 +10,7 @@
  ******************************************************************************/
 #pragma use_dxc
 #pragma kernel InitBlockRadixSortKeyValue
+#pragma kernel InitDescending
 #pragma kernel InitRandom
 #pragma kernel InitStability
 #pragma kernel GlobalHistogram
@@ -83,6 +84,13 @@ groupshared uint g_waveHists[BIN_PART_SIZE];                        //Shared mem
 
 [numthreads(1024, 1, 1)]
 void InitBlockRadixSortKeyValue(int3 id : SV_DispatchThreadID)
+{
+    for (int i = id.x; i < 1024; i += 1024 * 256)
+        b_globalHist[i] = 0;
+}
+
+[numthreads(1024, 1, 1)]
+void InitDescending(int3 id : SV_DispatchThreadID)
 {
     for (int i = id.x; i < e_size; i += 1024 * 256)
     {

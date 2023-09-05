@@ -63,14 +63,14 @@ public class OneSweepKeyValue : MonoBehaviour
     private const int minSize = 15;
     private const int maxSize = 28;
 
-    private const int k_init = 0;
-    private const int k_initRandom = 1;
-    private const int k_initStability = 2;
-    private const int k_globalHist = 3;
-    private const int k_scatterOne = 4;
-    private const int k_scatterTwo = 5;
-    private const int k_scatterThree = 6;
-    private const int k_scatterFour = 7;
+    private const int k_initDescending = 1;
+    private const int k_initRandom = 2;
+    private const int k_initStability = 3;
+    private const int k_globalHist = 4;
+    private const int k_scatterOne = 5;
+    private const int k_scatterTwo = 6;
+    private const int k_scatterThree = 7;
+    private const int k_scatterFour = 8;
 
     private int globalHistThreadBlocks;
     private int radixPasses;
@@ -129,7 +129,7 @@ public class OneSweepKeyValue : MonoBehaviour
 
     private void Dispatcher()
     {
-        ResetBuffers();
+        ResetBuffersDescending();
 
         switch (testType)
         {
@@ -197,8 +197,8 @@ public class OneSweepKeyValue : MonoBehaviour
         altBuffer = new ComputeBuffer(_size, sizeof(uint));
         altPayloadBuffer = new ComputeBuffer(_size, sizeof(uint));
 
-        compute.SetBuffer(k_init, "b_sort", sortBuffer);
-        compute.SetBuffer(k_init, "b_sortPayload", sortPayloadBuffer);
+        compute.SetBuffer(k_initDescending, "b_sort", sortBuffer);
+        compute.SetBuffer(k_initDescending, "b_sortPayload", sortPayloadBuffer);
         compute.SetBuffer(k_initRandom, "b_sort", sortBuffer);
         compute.SetBuffer(k_initRandom, "b_sortPayload", sortPayloadBuffer);
         compute.SetBuffer(k_initStability, "b_sort", sortBuffer);
@@ -243,10 +243,10 @@ public class OneSweepKeyValue : MonoBehaviour
         passHistThree = new ComputeBuffer(_size / partitionSize * radix, sizeof(uint));
         passHistFour = new ComputeBuffer(_size / partitionSize * radix, sizeof(uint));
 
-        compute.SetBuffer(k_init, "b_passHist", passHistBuffer);
-        compute.SetBuffer(k_init, "b_passTwo", passHistTwo);
-        compute.SetBuffer(k_init, "b_passThree", passHistThree);
-        compute.SetBuffer(k_init, "b_passFour", passHistFour);
+        compute.SetBuffer(k_initDescending, "b_passHist", passHistBuffer);
+        compute.SetBuffer(k_initDescending, "b_passTwo", passHistTwo);
+        compute.SetBuffer(k_initDescending, "b_passThree", passHistThree);
+        compute.SetBuffer(k_initDescending, "b_passFour", passHistFour);
 
         compute.SetBuffer(k_initRandom, "b_passHist", passHistBuffer);
         compute.SetBuffer(k_initRandom, "b_passTwo", passHistTwo);
@@ -268,7 +268,7 @@ public class OneSweepKeyValue : MonoBehaviour
     {
         globalHistBuffer = new ComputeBuffer(radix * radixPasses, sizeof(uint));
 
-        compute.SetBuffer(k_init, "b_globalHist", globalHistBuffer);
+        compute.SetBuffer(k_initDescending, "b_globalHist", globalHistBuffer);
         compute.SetBuffer(k_initRandom, "b_globalHist", globalHistBuffer);
         compute.SetBuffer(k_initStability, "b_globalHist", globalHistBuffer);
         compute.SetBuffer(k_globalHist, "b_globalHist", globalHistBuffer);
@@ -281,7 +281,7 @@ public class OneSweepKeyValue : MonoBehaviour
     {
         indexBuffer = new ComputeBuffer(radixPasses, sizeof(uint));
 
-        compute.SetBuffer(k_init, "b_index", indexBuffer);
+        compute.SetBuffer(k_initDescending, "b_index", indexBuffer);
         compute.SetBuffer(k_initRandom, "b_index", indexBuffer);
         compute.SetBuffer(k_initStability, "b_index", indexBuffer);
 
@@ -300,15 +300,24 @@ public class OneSweepKeyValue : MonoBehaviour
     private void DispatchKernels()
     {
         compute.Dispatch(k_globalHist, globalHistThreadBlocks, 1, 1);
-        compute.Dispatch(k_scatterOne, size / partitionSize, 1, 1);
-        compute.Dispatch(k_scatterTwo, size / partitionSize, 1, 1);
-        compute.Dispatch(k_scatterThree, size / partitionSize, 1, 1);
-        compute.Dispatch(k_scatterFour, size / partitionSize, 1, 1);
+        if (size > partitionSize)
+        {
+            compute.Dispatch(k_scatterOne, size / partitionSize, 1, 1);
+            compute.Dispatch(k_scatterTwo, size / partitionSize, 1, 1);
+            compute.Dispatch(k_scatterThree, size / partitionSize, 1, 1);
+            compute.Dispatch(k_scatterFour, size / partitionSize, 1, 1);
+        else
+        {
+            compute.Dispatch(k_scatterOne, 1, 1, 1);
+            compute.Dispatch(k_scatterTwo, 1, 1, 1);
+            compute.Dispatch(k_scatterThree, 1, 1, 1);
+            compute.Dispatch(k_scatterFour, 1, 1, 1);
+        }
     }
 
-    private void ResetBuffers()
+    private void ResetBuffersDescending()
     {
-        compute.Dispatch(k_init, 256, 1, 1);
+        compute.Dispatch(k_initDescending, 256, 1, 1);
     }
 
     private void ResetBuffersRandom()
