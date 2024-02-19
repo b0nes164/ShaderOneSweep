@@ -2,7 +2,7 @@
 ![Sorting Speeds Comparison(1)](https://github.com/b0nes164/ShaderOneSweep/assets/68340554/7bc88d9d-fce4-48b9-9854-de47ea83b8aa)
 
 # NOTICE: THIS REPO IS OUTDATED AND WILL BE ARCHIVED SOON! IT CONTAINS KNOWN BUGS
-# PLEASE USE THE REPO FOUND AT https://github.com/b0nes164/ShaderOneSweep
+# PLEASE USE THE REPO FOUND AT https://github.com/b0nes164/GPUSorting
 
 This project is an HLSL compute shader implementation of the current state of the art GPU sorting algorithm, Adinets and Merrill's [OneSweep](https://research.nvidia.com/publication/2022-06_onesweep-faster-least-significant-digit-radix-sort-gpus), an LSD radix sort that uses Merrill and Garland's [Chained Scan with Decoupled Lookback](https://research.nvidia.com/publication/2016-03_single-pass-parallel-prefix-scan-decoupled-look-back) to reduce the overall global data movement during a digit-binning pass from $3n$ to $2n$. 
 
