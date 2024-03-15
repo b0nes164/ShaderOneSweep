@@ -1,3 +1,15 @@
+/******************************************************************************
+ * OneSweep Implementation Toy Demo
+ *
+ * SPDX-License-Identifier: MIT
+ * Author:  Thomas Smith 3/14/2024
+ * 
+ * Based off of Research by:
+ *          Andy Adinets, Nvidia Corporation
+ *          Duane Merrill, Nvidia Corporation
+ *          https://research.nvidia.com/publication/2022-06_onesweep-faster-least-significant-digit-radix-sort-gpus
+ *
+ ******************************************************************************/
 using System.Collections;
 using System.Collections.Generic;
 using UnityEngine;
@@ -6,147 +18,62 @@ using System.IO;
 
 public class OneSweep : MonoBehaviour
 {
-    private enum TestType
-    {
-        //Validates the sort at the current input size on a decreasing sequence of integers
-        ValidateSort,
-
-        //Validates the sort at the current input size on a randomly generated bag of integers
-        ValidateRandom,
-
-        //Times the execution of the a single digit binning pass
-        SinglePassTimingTest,
-
-        //Times the execution of the entire algorithm
-        AllPassTimingTest,
-
-        //Times the execution of the algorithm using a random input instead of the default sequence of decreasing integers.
-        //Because this results in a higher entropy than the default, it tends to have better performance.
-        AllPassTimingTestRandom,
-
-        //Executes the algorithm 2000 times, then records the execution time in a csv file
-        RecordTimingData,
-    }
+    [Range(k_minSize, k_maxSize)]
+    public int m_sizeExponent;
 
     [SerializeField]
-    private TestType testType;
+    private ComputeShader m_compute;
 
-    [Range(minSize, maxSize)]
-    public int sizeExponent;
+    private ComputeBuffer m_sortBuffer;
+    private ComputeBuffer m_altBuffer;
+    private ComputeBuffer m_globalHistBuffer;
+    private ComputeBuffer m_indexBuffer;
+    private ComputeBuffer m_passHistBuffer;
+    private ComputeBuffer m_errCountBuffer;
 
-    [SerializeField]
-    private ComputeShader compute;
+    private const int k_minSize = 15;
+    private const int k_maxSize = 27;
 
-    [SerializeField]
-    private bool validateText;
+    private const int m_initOneSweepKernel = 0;
+    private const int m_globalHistKernel = 1;
+    private const int m_scanKernel = 2;
+    private const int m_digitBinPassKernel = 3;
+    private const int m_initRandomKernel = 4;
+    private const int m_validationKernel = 5;
 
-    [SerializeField]
-    private bool quickText;
+    private const int k_radixPasses = 4;
+    private const int k_radix = 256;
+    private const int k_partitionSize = 3840;
+    private const string k_computeShaderString = "OneSweep";
 
-    private ComputeBuffer sortBuffer;
-    private ComputeBuffer altBuffer;
-    private ComputeBuffer globalHistBuffer;
-
-    private ComputeBuffer indexBuffer;
-    private ComputeBuffer passHistBuffer;
-    private ComputeBuffer passHistTwo;
-    private ComputeBuffer passHistThree;
-    private ComputeBuffer passHistFour;
-
-    private ComputeBuffer timingBuffer;
-
-    private const int minSize = 15;
-    private const int maxSize = 28;
-
-    private const int k_init = 0;
-    private const int k_initRandom = 1;
-    private const int k_globalHist = 2;
-    private const int k_scatterOne = 3;
-    private const int k_scatterTwo = 4;
-    private const int k_scatterThree = 5;
-    private const int k_scatterFour = 6;
-
-    private int globalHistThreadBlocks;
-    private int radixPasses;
-    private int radix;
-    private int partitionSize;
-    private string computeShaderString;
-
-    private uint[] validationArray;
-
-    private int size;
-    private bool breaker;
-
-    OneSweep()
-    {
-        radixPasses = 4;
-        radix = 256;
-        globalHistThreadBlocks = 2048;
-        partitionSize = 7680;
-        computeShaderString = "OneSweep";
-    }
+    private int m_size = 0;
+    private int m_threadBlocks = 0;
 
     private void Start()
     {
         CheckShader();
-
-        size = 1 << sizeExponent;
-        UpdateSize(size);
+        m_size = 1 << 15;
+        m_threadBlocks = divRoundUp(m_size, k_partitionSize);
+        UpdateSize();
         UpdateGlobHistBuffer();
         UpdateIndexBuffer();
-        UpdateTimingBuffer();
-        breaker = true;
+        UpdateErrorBuffer();
 
-        Debug.Log(computeShaderString + ": init Complete.");
+        Debug.Log(k_computeShaderString + ": init Complete.");
+        Debug.Log("Press space to run and test OneSweep at the current size.");
     }
 
     private void Update()
     {
         if (Input.GetKeyDown(KeyCode.Space))
         {
-            if (breaker)
+            if (m_size != (1 << m_sizeExponent))
             {
-                if (size != (1 << sizeExponent))
-                {
-                    size = 1 << sizeExponent;
-                    UpdateSize(size);
-                }
-
-                Dispatcher();
+                m_size = 1 << m_sizeExponent;
+                m_threadBlocks = divRoundUp(m_size, k_partitionSize);
+                UpdateSize();
             }
-            else
-            {
-                Debug.LogWarning("Please allow the current test to complete before attempting any other tests.");
-            }
-        }
-    }
-
-    private void Dispatcher()
-    {
-        ResetBuffers();
-
-        switch (testType)
-        {
-            case TestType.ValidateSort:
-                StartCoroutine(ValidateSort(size));
-                break;
-            case TestType.ValidateRandom:
-                StartCoroutine(ValidateSortRandom(size));
-                break;
-            case TestType.SinglePassTimingTest:
-                StartCoroutine(SinglePassTimingTest(size));
-                break;
-            case TestType.AllPassTimingTest:
-                StartCoroutine(AllPassTimingTest(size));
-                break;
-            case TestType.AllPassTimingTestRandom:
-                StartCoroutine(AllPassTimingTestRandom(size));
-                break;
-            case TestType.RecordTimingData:
-                StartCoroutine(RecordTimingData());
-                break;
-            default:
-                break;
+            ValidateSort();
         }
     }
 
@@ -154,337 +81,156 @@ public class OneSweep : MonoBehaviour
     {
         try
         {
-            compute.FindKernel("Init" + computeShaderString);
+            m_compute.FindKernel("Init" + k_computeShaderString);
         }
         catch
         {
             Debug.LogError("Kernel(s) not found, most likely you do not have the correct compute shader attached to the game object");
-            Debug.LogError("The correct compute shader is" + computeShaderString + ". Exit play mode and attatch to the gameobject, then retry.");
+            Debug.LogError("The correct compute shader is" + k_computeShaderString + ". Exit play mode and attatch to the gameobject, then retry.");
             Debug.LogError("Destroying this object.");
             Destroy(this);
         }
     }
 
-    private void UpdateSize(int _size)
+    private void UpdateSize()
     {
-        compute.SetInt("e_size", _size);
-        UpdateSortBuffers(_size);
-        UpdatePassHistBuffer(_size);
+        m_compute.SetInt("e_numKeys", m_size);
+        m_compute.SetInt("e_threadBlocks", m_threadBlocks);
+        UpdateSortBuffers();
+        UpdatePassHistBuffer();
     }
 
-    private void UpdateSortBuffers(int _size)
+    private void UpdateSortBuffers()
     {
-        if (sortBuffer != null)
-            sortBuffer.Dispose();
-        if (altBuffer != null)
-            altBuffer.Dispose();
+        if (m_sortBuffer != null)
+            m_sortBuffer.Dispose();
+        if (m_altBuffer != null)
+            m_altBuffer.Dispose();
 
-        sortBuffer = new ComputeBuffer(_size, sizeof(uint));
-        altBuffer = new ComputeBuffer(_size, sizeof(uint));
-
-        compute.SetBuffer(k_init, "b_sort", sortBuffer);
-        compute.SetBuffer(k_initRandom, "b_sort", sortBuffer);
-        compute.SetBuffer(k_globalHist, "b_sort", sortBuffer);
-
-        compute.SetBuffer(k_scatterOne, "b_sort", sortBuffer);
-        compute.SetBuffer(k_scatterOne, "b_alt", altBuffer);
-
-        compute.SetBuffer(k_scatterTwo, "b_sort", sortBuffer);
-        compute.SetBuffer(k_scatterTwo, "b_alt", altBuffer);
-
-        compute.SetBuffer(k_scatterThree, "b_sort", sortBuffer);
-        compute.SetBuffer(k_scatterThree, "b_alt", altBuffer);
-
-        compute.SetBuffer(k_scatterFour, "b_sort", sortBuffer);
-        compute.SetBuffer(k_scatterFour, "b_alt", altBuffer);
+        m_sortBuffer = new ComputeBuffer(m_size, sizeof(uint));
+        m_altBuffer = new ComputeBuffer(m_size, sizeof(uint));
     }
 
-    private void UpdatePassHistBuffer(int _size)
+    private void UpdatePassHistBuffer()
     {
-        if (passHistBuffer != null)
-            passHistBuffer.Dispose();
-        if (passHistTwo != null)
-            passHistTwo.Dispose();
-        if (passHistThree != null)
-            passHistThree.Dispose();
-        if (passHistFour != null)
-            passHistFour.Dispose();
+        if (m_passHistBuffer != null)
+            m_passHistBuffer.Dispose();
 
-        passHistBuffer = new ComputeBuffer(_size / partitionSize * radix, sizeof(uint));
-        passHistTwo = new ComputeBuffer(_size / partitionSize * radix, sizeof(uint));
-        passHistThree = new ComputeBuffer(_size / partitionSize * radix, sizeof(uint));
-        passHistFour = new ComputeBuffer(_size / partitionSize * radix, sizeof(uint));
-
-        //init
-        compute.SetBuffer(k_init, "b_passHist", passHistBuffer);
-        compute.SetBuffer(k_init, "b_passTwo", passHistTwo);
-        compute.SetBuffer(k_init, "b_passThree", passHistThree);
-        compute.SetBuffer(k_init, "b_passFour", passHistFour);
-
-        //init random
-        compute.SetBuffer(k_initRandom, "b_passHist", passHistBuffer);
-        compute.SetBuffer(k_initRandom, "b_passTwo", passHistTwo);
-        compute.SetBuffer(k_initRandom, "b_passThree", passHistThree);
-        compute.SetBuffer(k_initRandom, "b_passFour", passHistFour);
-
-        //scatters
-        compute.SetBuffer(k_scatterOne, "b_passHist", passHistBuffer);
-        compute.SetBuffer(k_scatterTwo, "b_passTwo", passHistTwo);
-        compute.SetBuffer(k_scatterThree, "b_passThree", passHistThree);
-        compute.SetBuffer(k_scatterFour, "b_passFour", passHistFour);
+        m_passHistBuffer = new ComputeBuffer(m_threadBlocks * k_radix * k_radixPasses, sizeof(uint));
     }
 
     private void UpdateGlobHistBuffer()
     {
-        globalHistBuffer = new ComputeBuffer(radix * radixPasses, sizeof(uint));
-
-        compute.SetBuffer(k_init, "b_globalHist", globalHistBuffer);
-        compute.SetBuffer(k_initRandom, "b_globalHist", globalHistBuffer);
-        compute.SetBuffer(k_globalHist, "b_globalHist", globalHistBuffer);
-        compute.SetBuffer(k_scatterOne, "b_globalHist", globalHistBuffer);
-        compute.SetBuffer(k_scatterTwo, "b_globalHist", globalHistBuffer);
-        compute.SetBuffer(k_scatterThree, "b_globalHist", globalHistBuffer);
-        compute.SetBuffer(k_scatterFour, "b_globalHist", globalHistBuffer);
+        if (m_globalHistBuffer != null)
+            m_globalHistBuffer.Dispose();
+        m_globalHistBuffer = new ComputeBuffer(k_radixPasses * k_radix, sizeof(uint));
     }
+
     private void UpdateIndexBuffer()
     {
-        indexBuffer = new ComputeBuffer(radixPasses, sizeof(uint));
-
-        compute.SetBuffer(k_init, "b_index", indexBuffer);
-        compute.SetBuffer(k_initRandom, "b_index", indexBuffer);
-
-        compute.SetBuffer(k_scatterOne, "b_index", indexBuffer);
-        compute.SetBuffer(k_scatterTwo, "b_index", indexBuffer);
-        compute.SetBuffer(k_scatterThree, "b_index", indexBuffer);
-        compute.SetBuffer(k_scatterFour, "b_index", indexBuffer);
+        if (m_indexBuffer != null)
+            m_indexBuffer.Dispose();
+        m_indexBuffer = new ComputeBuffer(k_radixPasses, sizeof(uint));
     }
-    private void UpdateTimingBuffer()
+
+    private void UpdateErrorBuffer()
     {
-        timingBuffer = new ComputeBuffer(1, sizeof(uint));
-        compute.SetBuffer(k_scatterOne, "b_timing", timingBuffer);
-        compute.SetBuffer(k_scatterFour, "b_timing", timingBuffer);
+        if (m_errCountBuffer != null)
+            m_errCountBuffer.Dispose();
+        m_errCountBuffer = new ComputeBuffer(1, sizeof(uint));
+    }
+    private void SetStaticBuffers()
+    {
+        //Input
+        m_compute.SetBuffer(m_initRandomKernel, "b_sort", m_sortBuffer);
+
+        //Init
+        m_compute.SetBuffer(m_initOneSweepKernel, "b_passHist", m_passHistBuffer);
+        m_compute.SetBuffer(m_initOneSweepKernel, "b_globalHist", m_globalHistBuffer);
+        m_compute.SetBuffer(m_initOneSweepKernel, "b_index", m_indexBuffer);
+
+        //GlobalHist
+        m_compute.SetBuffer(m_globalHistKernel, "b_sort", m_sortBuffer);
+        m_compute.SetBuffer(m_globalHistKernel, "b_globalHist", m_globalHistBuffer);
+
+        //Scan
+        m_compute.SetBuffer(m_scanKernel, "b_globalHist", m_globalHistBuffer);
+        m_compute.SetBuffer(m_scanKernel, "b_passHist", m_passHistBuffer);
+
+        //DigitBinningPass
+        m_compute.SetBuffer(m_digitBinPassKernel, "b_passHist", m_passHistBuffer);
+        m_compute.SetBuffer(m_digitBinPassKernel, "b_globalHist", m_globalHistBuffer);
+        m_compute.SetBuffer(m_digitBinPassKernel, "b_index", m_indexBuffer);
+
+        //Validate
+        m_compute.SetBuffer(m_validationKernel, "b_sort", m_sortBuffer);
+        m_compute.SetBuffer(m_validationKernel, "b_errorCount", m_errCountBuffer);
     }
 
     private void DispatchKernels()
     {
-        compute.Dispatch(k_globalHist, globalHistThreadBlocks, 1, 1);
-        compute.Dispatch(k_scatterOne, size / partitionSize, 1, 1);
-        compute.Dispatch(k_scatterTwo, size / partitionSize, 1, 1);
-        compute.Dispatch(k_scatterThree, size / partitionSize, 1, 1);
-        compute.Dispatch(k_scatterFour, size / partitionSize, 1, 1);
+        SetStaticBuffers();
+        m_compute.SetInt("e_seed", (int)(Time.realtimeSinceStartup * 100000.0f));
+        m_compute.Dispatch(m_initRandomKernel, 256, 1, 1);
+
+        m_compute.Dispatch(m_initOneSweepKernel, 256, 1, 1);
+        m_compute.Dispatch(m_globalHistKernel, m_threadBlocks, 1, 1);
+        
+        m_compute.Dispatch(m_scanKernel, k_radixPasses, 1, 1);
+
+        m_compute.SetInt("e_radixShift", 0);
+        m_compute.SetBuffer(m_digitBinPassKernel, "b_sort", m_sortBuffer);
+        m_compute.SetBuffer(m_digitBinPassKernel, "b_alt", m_altBuffer);
+        m_compute.Dispatch(m_digitBinPassKernel, m_threadBlocks, 1, 1);
+
+        m_compute.SetInt("e_radixShift", 8);
+        m_compute.SetBuffer(m_digitBinPassKernel, "b_sort", m_altBuffer);
+        m_compute.SetBuffer(m_digitBinPassKernel, "b_alt", m_sortBuffer);
+        m_compute.Dispatch(m_digitBinPassKernel, m_threadBlocks, 1, 1);
+
+        m_compute.SetInt("e_radixShift", 16);
+        m_compute.SetBuffer(m_digitBinPassKernel, "b_sort", m_sortBuffer);
+        m_compute.SetBuffer(m_digitBinPassKernel, "b_alt", m_altBuffer);
+        m_compute.Dispatch(m_digitBinPassKernel, m_threadBlocks, 1, 1);
+
+        m_compute.SetInt("e_radixShift", 24);
+        m_compute.SetBuffer(m_digitBinPassKernel, "b_sort", m_altBuffer);
+        m_compute.SetBuffer(m_digitBinPassKernel, "b_alt", m_sortBuffer);
+        m_compute.Dispatch(m_digitBinPassKernel, m_threadBlocks, 1, 1);
     }
 
-    private void ResetBuffers()
+    private void ValidateSort()
     {
-        compute.Dispatch(k_init, 256, 1, 1);
-    }
-
-    private void ResetBuffersRandom()
-    {
-        compute.SetInt("e_seed", (int)(Time.realtimeSinceStartup * 100000.0f));
-        compute.Dispatch(k_initRandom, 256, 1, 1);
-    }
-
-    private IEnumerator ValidateSort(int _size)
-    {
-        breaker = false;
-
-        validationArray = new uint[_size];
         DispatchKernels();
-        sortBuffer.GetData(validationArray);
-        yield return new WaitForSeconds(.25f);  //To prevent unity from crashing
-        ValSort(_size);
+        uint[] errCount = new uint[1] { 0 };
+        m_errCountBuffer.SetData(errCount);
+        m_compute.Dispatch(m_validationKernel, 256, 1, 1);
+        m_errCountBuffer.GetData(errCount);
 
-        breaker = true;
-    }
-
-    private IEnumerator ValidateSortRandom(int _size)
-    {
-        breaker = false;
-
-        validationArray = new uint[_size];
-        ResetBuffersRandom();
-        DispatchKernels();
-        sortBuffer.GetData(validationArray);
-        yield return new WaitForSeconds(.25f);  //To prevent unity from crashing
-        ValRand(_size);
-
-        breaker = true;
-    }
-
-    private IEnumerator SinglePassTimingTest(int _size)
-    {
-        breaker = false;
-
-        compute.Dispatch(k_globalHist, globalHistThreadBlocks, 1, 1);
-        AsyncGPUReadbackRequest request = AsyncGPUReadback.Request(globalHistBuffer);
-        yield return new WaitUntil(() => request.done);
-
-        float time = Time.realtimeSinceStartup;
-        compute.Dispatch(k_scatterOne, _size / partitionSize, 1, 1);
-        request = AsyncGPUReadback.Request(timingBuffer);
-        yield return new WaitUntil(() => request.done);
-        time = Time.realtimeSinceStartup - time;
-
-        Debug.Log("Raw Time: " + time);
-        Debug.Log("Estimated Speed: " + (_size / time) + " ele/sec.");
-
-        breaker = true;
-    }
-
-    private IEnumerator AllPassTimingTest(int _size)
-    {
-        breaker = false;
-
-        AsyncGPUReadbackRequest request = AsyncGPUReadback.Request(passHistFour);
-        yield return new WaitUntil(() => request.done);
-
-        float time = Time.realtimeSinceStartup;
-        DispatchKernels();
-        request = AsyncGPUReadback.Request(timingBuffer);
-        yield return new WaitUntil(() => request.done);
-        time = Time.realtimeSinceStartup - time;
-
-        Debug.Log("Raw Time: " + time);
-        Debug.Log("Estimated Speed: " + (_size / time) + " ele/sec.");
-
-        breaker = true;
-    }
-
-    private IEnumerator AllPassTimingTestRandom(int _size)
-    {
-        breaker = false;
-
-        ResetBuffersRandom();
-        AsyncGPUReadbackRequest request = AsyncGPUReadback.Request(passHistFour);
-        yield return new WaitUntil(() => request.done);
-
-        float time = Time.realtimeSinceStartup;
-        DispatchKernels();
-        request = AsyncGPUReadback.Request(timingBuffer);
-        yield return new WaitUntil(() => request.done);
-        time = Time.realtimeSinceStartup - time;
-
-        Debug.Log("Raw Time: " + time);
-        Debug.Log("Estimated Speed: " + (_size / time) + " ele/sec.");
-
-        breaker = true;
-    }
-
-    public IEnumerator RecordTimingData()
-    {
-        breaker = false;
-        Debug.Log("Beginning timing test, this may take a while.");
-
-
-        List<string> csv = new List<string>();
-        float time;
-
-        for (int i = 0; i < 2000; ++i)
-        {
-            compute.SetInt("e_seed", i + 1);
-            compute.Dispatch(k_initRandom, 256, 1, 1);
-            AsyncGPUReadbackRequest request = AsyncGPUReadback.Request(passHistFour);
-            yield return new WaitUntil(() => request.done);
-
-            time = Time.realtimeSinceStartup;
-            DispatchKernels();
-            request = AsyncGPUReadback.Request(timingBuffer);
-            yield return new WaitUntil(() => request.done);
-            time = Time.realtimeSinceStartup - time;
-
-            if (i != 0)
-                csv.Add("" + time);
-
-            if ((i & 31) == 0)
-                Debug.Log("Running");
-        }
-
-        StreamWriter sWriter = new StreamWriter(computeShaderString + ".csv");
-        sWriter.WriteLine("Total Time " + computeShaderString + ":");
-        foreach (string str in csv)
-            sWriter.WriteLine(str);
-        sWriter.Close();
-        Debug.Log("Test Complete");
-
-        breaker = true;
-    }
-
-    private void ValSort(int _size)
-    {
-        bool isValid = true;
-        int errCount = 0;
-
-        for (uint i = 0; i < _size; ++i)
-        {
-            if (validationArray[i] != i + 1)
-            {
-
-                if (isValid)
-                    isValid = false;
-
-                if (quickText)
-                    errCount++;
-
-                if (errCount < 1024)
-                    Debug.LogError("EXPECTED SAME AT INDEX " + i + ": " + (i + 1) + ", " + validationArray[i]);
-            }
-        }
-
-        if (isValid)
-            Debug.Log("Sort Passed");
+        if(errCount[0] == 0)
+            Debug.Log("OneSweep passed test at size " + m_size + ".");
         else
-            Debug.LogError("Sort Failed");
+            Debug.LogError("OneSweep failed test at size " + m_size + " with " + errCount[0] + " errors.");
     }
 
-    private void ValRand(int _size)
+    static int divRoundUp(int x, int y)
     {
-        bool isValid = true;
-        int errCount = 0;
-
-        for (int i = 1; i < _size; ++i)
-        {
-            if (validationArray[i] < validationArray[i - 1])
-            {
-
-                if (isValid)
-                    isValid = false;
-
-                if (quickText)
-                    errCount++;
-
-                if (errCount < 1024)
-                    Debug.LogError("EXPECTED SAME AT INDEX " + i + ": " + (i + 1) + ", " + validationArray[i]);
-            }
-        }
-
-        if (isValid)
-            Debug.Log("Sort Passed");
-        else
-            Debug.LogError("Sort Failed");
+        return (x + y - 1) / y;
     }
 
     private void OnDestroy()
     {
-        if (sortBuffer != null)
-            sortBuffer.Dispose();
-        if (altBuffer != null)
-            altBuffer.Dispose();
-        if (globalHistBuffer != null)
-            globalHistBuffer.Dispose();
-        if (indexBuffer != null)
-            indexBuffer.Dispose();
-
-        if (passHistBuffer != null)
-            passHistBuffer.Dispose();
-        if (passHistTwo != null)
-            passHistTwo.Dispose();
-        if (passHistThree != null)
-            passHistThree.Dispose();
-        if (passHistFour != null)
-            passHistFour.Dispose();
-
-        if (timingBuffer != null)
-            timingBuffer.Dispose();
+        if (m_sortBuffer != null)
+            m_sortBuffer.Dispose();
+        if (m_altBuffer != null)
+            m_altBuffer.Dispose();
+        if (m_globalHistBuffer != null)
+            m_globalHistBuffer.Dispose();
+        if (m_indexBuffer != null)
+            m_indexBuffer.Dispose();
+        if (m_passHistBuffer != null)
+            m_passHistBuffer.Dispose();
+        if (m_errCountBuffer != null)
+            m_errCountBuffer.Dispose();
     }
 }
